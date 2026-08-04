@@ -1,0 +1,245 @@
+name: Build iOS IPA
+
+# Builds the native iOS host app and packages it as an unsigned `.ipa`, the
+# same way `platform/ios/README.md` documents doing it by hand on a Mac:
+#
+#   sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+#   sh platform/ios/scripts/build-host.sh iphoneos Release
+#   sh platform/ios/scripts/package-ipa.sh
+#   sh platform/ios/scripts/verify-ipa.sh
+#
+# Nothing here signs anything: the runner has no certificate, no provisioning
+# profile and no team, which is exactly what `package-ipa.sh` requires (it
+# refuses to package a signed app). Whoever installs the artifact signs it
+# locally with their own Apple account.
+#
+# The `.ipa` is always uploaded as a build artifact. It is additionally
+# attached to a GitHub release when a tag matching `ios-v*` is pushed, or when
+# the workflow is dispatched manually with `publish_release` enabled.
+
+on:
+  push:
+    branches:
+      - ios-host
+      - trunk
+      # Long-running port branches, so a build is available before merging.
+      - 'ci/**'
+      - 'ios/**'
+      - 'claude/**'
+    tags:
+      - 'ios-v*'
+  pull_request:
+    branches:
+      - ios-host
+      - trunk
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Attach the unsigned IPA to a GitHub release
+        type: boolean
+        default: false
+      release_tag:
+        description: Tag to publish the release under (required if publishing)
+        type: string
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # `platform/ios/Sources/NativeHost.swift` compiles against iOS 26 APIs
+  # (`UIButton.Configuration.glass()`, `View.glassEffect`), so the runner needs
+  # an SDK at least this new. `macos-latest` currently ships Xcode 26.
+  MINIMUM_XCODE_MAJOR: '26'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Only pull requests get superseded; pushes are left alone so a build that is
+  # being used as a reference isn't cancelled by the next commit.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-ios:
+    name: Unsigned IPA (arm64)
+    runs-on: macos-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout touchHLE
+        uses: actions/checkout@main
+        with:
+          submodules: recursive
+
+      # The runner images carry several Xcodes. Pick the newest one rather than
+      # whatever `xcode-select` happens to point at, and fail with a clear
+      # message if it is too old to have the iOS SDK the host app needs.
+      - name: Select Xcode
+        run: |
+          set -eu
+          best=
+          best_version=
+          best_key=0
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            version=
+            for plist in "$app/Contents/version.plist" "$app/Contents/Info.plist"; do
+              [ -f "$plist" ] || continue
+              version=$(/usr/libexec/PlistBuddy -c \
+                'Print :CFBundleShortVersionString' "$plist" 2>/dev/null || true)
+              [ -n "$version" ] && break
+            done
+            [ -n "$version" ] || continue
+            major=${version%%.*}
+            case "$major" in ''|*[!0-9]*) continue ;; esac
+            rest=${version#"$major"}
+            minor=${rest#.}
+            minor=${minor%%.*}
+            case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
+            key=$((major * 1000 + minor))
+            if [ "$key" -gt "$best_key" ]; then
+              best_key=$key
+              best=$app
+              best_version=$version
+            fi
+          done
+          if [ -z "$best" ]; then
+            echo "No Xcode found in /Applications" >&2
+            exit 1
+          fi
+          echo "Using Xcode $best_version at $best"
+          if [ "$((best_key / 1000))" -lt "$MINIMUM_XCODE_MAJOR" ]; then
+            echo "Xcode $MINIMUM_XCODE_MAJOR or newer is required to build the iOS host app." >&2
+            echo "The newest one on this runner is $best_version." >&2
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$best/Contents/Developer" >> "$GITHUB_ENV"
+          echo "XCODE_VERSION=$best_version" >> "$GITHUB_ENV"
+
+      - name: Report toolchain versions
+        run: |
+          set -eu
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          rustc --version
+          cargo --version
+          python3 --version
+
+      - name: Install the iOS Rust target
+        run: rustup target add aarch64-apple-ios
+
+      - name: Setup CMake and Ninja
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.29.0"
+
+      # Boost headers are only needed by dynarmic. The key matches the one the
+      # other macOS job uses, so the two jobs share one cache entry.
+      - name: Try to get cached copy of Boost
+        id: cache-boost
+        uses: actions/cache@main
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_macos
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        run: curl -L --retry 4 --retry-delay 2 -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Record the SDL revision
+        id: sdl
+        run: |
+          set -eu
+          echo "revision=$(git -C vendor/rust-sdl2/sdl2-sys/SDL rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # SDL2 is built once as a shared library and then embedded in the bundle;
+      # it only changes when the submodule does.
+      - name: Cache the shared SDL2 build
+        id: cache-sdl
+        uses: actions/cache@main
+        with:
+          path: build/sdl-shared-iphoneos
+          key: sdl-shared-iphoneos-${{ steps.sdl.outputs.revision }}-xcode-${{ env.XCODE_VERSION }}
+
+      # `build/rust-ios-native` is the cargo target directory for the iOS core
+      # (see `platform/ios/scripts/build-rust.sh`). It also holds the CMake
+      # builds of dynarmic, openal-soft and libxml2, which dominate a cold
+      # build, so it is worth carrying between runs.
+      - name: Cache the Rust and CMake build artifacts
+        uses: actions/cache@main
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/rust-ios-native
+          key: ios-rust-${{ hashFiles('Cargo.lock') }}-${{ steps.sdl.outputs.revision }}
+          restore-keys: |
+            ios-rust-${{ hashFiles('Cargo.lock') }}-
+            ios-rust-
+
+      - if: ${{ steps.cache-sdl.outputs.cache-hit != 'true' }}
+        name: Build the shared SDL2
+        run: sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
+      - name: Build the host app
+        run: sh platform/ios/scripts/build-host.sh iphoneos Release
+
+      - name: Package the unsigned IPA
+        run: sh platform/ios/scripts/package-ipa.sh
+
+      - name: Verify the unsigned IPA
+        run: sh platform/ios/scripts/verify-ipa.sh
+
+      - name: Summarise the build
+        if: always()
+        run: |
+          set -eu
+          ipa=dist/touchHLE-HyperHLE-iOS-unsigned.ipa
+          [ -f "$ipa" ] || exit 0
+          {
+            echo "### Unsigned iOS build"
+            echo
+            echo '```'
+            ls -lh "$ipa"
+            cat "$ipa.sha256"
+            echo '```'
+            echo
+            echo "The IPA is unsigned on purpose. Sign it locally with your own"
+            echo "Apple account (AltStore, SideStore, Sideloadly or Xcode), and"
+            echo "enable JIT before starting a game."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@main
+        with:
+          name: touchHLE_iOS_unsigned_ipa
+          path: |
+            dist/touchHLE-HyperHLE-iOS-unsigned.ipa
+            dist/touchHLE-HyperHLE-iOS-unsigned.ipa.sha256
+          if-no-files-found: error
+
+      - name: Publish the IPA as a release
+        if: >-
+          startsWith(github.ref, 'refs/tags/ios-v') ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+        uses: softprops/action-gh-release@master
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}
+          name: touchHLE iOS ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}
+          draft: false
+          prerelease: true
+          fail_on_unmatched_files: true
+          body: |
+            Unsigned iOS build produced by the `Build iOS IPA` workflow from
+            commit ${{ github.sha }}.
+
+            The IPA contains no Apple ID, certificate, provisioning profile,
+            development team, device identifier, game or save. Sign it locally
+            with your own Apple account and enable JIT before starting a game —
+            see `platform/ios/README.md`.
+          files: |
+            dist/touchHLE-HyperHLE-iOS-unsigned.ipa
+            dist/touchHLE-HyperHLE-iOS-unsigned.ipa.sha256
