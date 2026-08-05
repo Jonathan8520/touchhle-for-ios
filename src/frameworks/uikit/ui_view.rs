@@ -986,8 +986,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setTranslatesAutoresizingMaskIntoConstraints:(bool)_translates { }
 - (bool)translatesAutoresizingMaskIntoConstraints { true }
-- (())setNeedsLayout { }
-- (())layoutIfNeeded { }
 - (())addConstraint:(id)_constraint { }
 - (())addConstraints:(id)_constraints { }
 - (())removeConstraint:(id)_constraint { }
@@ -1288,6 +1286,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     subviews.insert(clamped_index, view);
 
     () = msg![env; this_layer insertSublayer:subview_layer atIndex:(clamped_index as u32)];
+    // As in -addSubview:, a view that has just entered a hierarchy has
+    // never been laid out.
+    set_needs_layout(env, view);
 }
 
 - (())insertSubview:(id)view belowSubview:(id)sibling {
@@ -1317,6 +1318,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         () = msg![env; this_layer addSublayer:subview_layer];
     }
+    set_needs_layout(env, view);
 }
 
 - (())insertSubview:(id)view aboveSubview:(id)sibling {
@@ -1343,6 +1345,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         let _: () = msg![env; this_layer addSublayer:subview_layer];
     }
+    set_needs_layout(env, view);
 }
 
 - (())bringSubviewToFront:(id)subview {
