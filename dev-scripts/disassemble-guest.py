@@ -28,6 +28,7 @@ MH_MAGIC = 0xFEEDFACE
 CPU_TYPE_ARM = 12
 CPU_SUBTYPE_ARM_V7 = 9
 LC_SEGMENT = 0x1
+VM_PROT_EXECUTE = 0x4
 
 WINDOW_BEFORE = 0x40
 WINDOW_AFTER = 0x40
@@ -92,18 +93,84 @@ def segments(data):
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, offset)
         if cmd == LC_SEGMENT:
-            _name, vmaddr, vmsize, fileoff, filesize = struct.unpack_from(
-                "<16sIIII", data, offset + 8
+            _name, vmaddr, vmsize, fileoff, filesize, _maxprot, initprot = (
+                struct.unpack_from("<16sIIIIii", data, offset + 8)
             )
-            yield vmaddr, vmsize, fileoff, filesize
+            yield vmaddr, vmsize, fileoff, filesize, initprot
         offset += cmdsize
 
 
 def file_offset(data, address):
-    for vmaddr, vmsize, fileoff, filesize in segments(data):
+    for vmaddr, vmsize, fileoff, filesize, _initprot in segments(data):
         if filesize and vmaddr <= address < vmaddr + vmsize:
             return fileoff + (address - vmaddr)
     return None
+
+
+def is_executable(data, address):
+    for vmaddr, vmsize, _fileoff, filesize, initprot in segments(data):
+        if filesize and vmaddr <= address < vmaddr + vmsize:
+            return bool(initprot & VM_PROT_EXECUTE)
+    return False
+
+
+def c_string_at(data, address, limit=192):
+    """The NUL-terminated printable string at `address`, if there is one.
+
+    Used to turn a selector reference into a selector name: the reference
+    holds a pointer, and the pointer leads to the name."""
+    offset = file_offset(data, address)
+    if offset is None:
+        return None
+    end = data.find(b"\0", offset, offset + limit)
+    if end <= offset:
+        return None
+    try:
+        text = data[offset:end].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return text if text.isprintable() else None
+
+
+def describe_pointer(data, address):
+    """What the word at `address` is, and what it points at."""
+    offset = file_offset(data, address)
+    if offset is None or offset + 4 > len(data):
+        return None
+    (word,) = struct.unpack_from("<I", data, offset)
+    if word == 0:
+        return "holds 0 (bound at load time — an external symbol)"
+    text = c_string_at(data, word)
+    if text is not None:
+        return "holds {:#x} -> {!r}".format(word, text)
+    name = class_name_at(data, word)
+    if name is not None:
+        return "holds {:#x} -> class {!r}".format(word, name)
+    return "holds {:#x}".format(word)
+
+
+def read_word(data, address):
+    offset = file_offset(data, address)
+    if offset is None or offset + 4 > len(data):
+        return None
+    (word,) = struct.unpack_from("<I", data, offset)
+    return word
+
+
+def class_name_at(data, address):
+    """The name of the Objective-C class object at `address`, if it is one.
+
+    32-bit ObjC2 lays a class out as {isa, superclass, cache, vtable, data},
+    and the read-only part it points at as {flags, instanceStart,
+    instanceSize, ivarLayout, name, ...}, so the name is two hops away at
+    +0x10 each."""
+    class_ro = read_word(data, address + 0x10)
+    if not class_ro:
+        return None
+    name_ptr = read_word(data, class_ro + 0x10)
+    if not name_ptr:
+        return None
+    return c_string_at(data, name_ptr, limit=128)
 
 
 def main(argv):
@@ -127,6 +194,14 @@ def main(argv):
         print("=== {:#x} ({}) ===".format(address, "Thumb" if thumb else "ARM"))
         if offset is None:
             print("not inside any mapped segment")
+            continue
+        pointer = describe_pointer(data, address)
+        if pointer is not None:
+            print(pointer)
+        if not is_executable(data, address):
+            # A selector or class reference, not code. Disassembling it would
+            # print noise.
+            print("(not in an executable segment; not disassembling)")
             continue
         code = data[offset : offset + WINDOW_BEFORE + WINDOW_AFTER]
         mode = capstone.CS_MODE_THUMB if thumb else capstone.CS_MODE_ARM
