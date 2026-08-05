@@ -1454,10 +1454,58 @@ impl Environment {
 
     /// Run the emulator. This is the main loop and won't return until app exit.
     /// Only `main.rs` should call this.
+    /// Report which thread is running, where, and what the others are waiting
+    /// for.
+    ///
+    /// An app that has stopped producing log output looks the same whether it
+    /// is stuck in a spin loop, deadlocked between two of its own threads, or
+    /// working through a few hundred megabytes of assets. Repeating this at an
+    /// interval tells them apart: a program that is getting somewhere moves,
+    /// and one that is stuck reports the same address every time. The
+    /// addresses are guest addresses, so `dev-scripts/disassemble-guest.py`
+    /// takes them directly.
+    fn sample_guest(&mut self) {
+        let elapsed = self.startup_time.elapsed().as_secs_f32();
+        let pc = self.cpu.regs()[cpu::Cpu::PC];
+        let mut others = String::new();
+        for (tid, thread) in self.threads.iter().enumerate() {
+            if tid == self.current_thread || !thread.active {
+                continue;
+            }
+            let waiting = match &thread.blocked_by {
+                ThreadBlock::NotBlocked => "ready".to_string(),
+                ThreadBlock::Sleeping(_) => "sleeping".to_string(),
+                ThreadBlock::Mutex(id) => format!("mutex {}", id),
+                ThreadBlock::Semaphore(ptr) => format!("semaphore {:?}", ptr),
+                ThreadBlock::Condition(ptr, _) => format!("condition {:?}", ptr),
+                ThreadBlock::Joining(other, _) => format!("joining thread {}", other),
+                ThreadBlock::WaitingForDebugger(_) => "the debugger".to_string(),
+                ThreadBlock::Suspended(count, _) => format!("suspended x{}", count),
+            };
+            others.push_str(&format!(", {}: {}", tid, waiting));
+        }
+        log!(
+            "guest sample at {:.0}s: thread {} at {:#x}{}",
+            elapsed,
+            self.current_thread,
+            pc,
+            others,
+        );
+    }
+
     pub fn run(mut self) {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
+        let mut next_sample = self.options.sample_guest.map(|interval| {
+            log!(
+                "Sampling what the guest is running every {} s. An app that stops \
+                 logging has either stalled or is grinding through work, and nothing \
+                 else tells the two apart.",
+                interval.as_secs_f32()
+            );
+            Instant::now() + interval
+        });
         loop {
             #[cfg(target_os = "ios")]
             if crate::take_host_exit_request() {
@@ -1476,6 +1524,12 @@ impl Environment {
                 // or trying to poll for events too often. At the same time,
                 // very large values are bad for responsiveness.
                 self.remaining_ticks = Some(100_000);
+            }
+            if let Some(due) = next_sample {
+                if Instant::now() >= due {
+                    self.sample_guest();
+                    next_sample = Some(Instant::now() + self.options.sample_guest.unwrap());
+                }
             }
             let mut kill_current_thread = false;
             if let Some(w) = self.window.as_mut() {

@@ -367,6 +367,17 @@ Other options:
         --trace-objc=all logs every message, which is far too much output
         for more than a few seconds of a run.
 
+    --sample-guest=<seconds>
+        For diagnostic builds. Every <seconds> of wall-clock time, log which
+        guest thread is running and the address it is executing, plus what
+        every other live thread is waiting for.
+        An app that stops producing log output looks the same whether it is
+        stuck in a spin loop, deadlocked between two of its own threads, or
+        working through a few hundred megabytes of assets. This tells them
+        apart: an app that is getting somewhere moves, and one that is stuck
+        reports the same address every time. The addresses are guest
+        addresses, so dev-scripts/disassemble-guest.py takes them directly.
+
     --fix-texture-min-filter
         Workaround for apps that rely on the default ES 1.1
         GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable

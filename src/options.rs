@@ -142,6 +142,8 @@ pub struct Options {
     /// A single empty string means "everything", which is only useful for a
     /// few seconds of a run.
     pub trace_objc: Vec<String>,
+    /// How often to report which guest thread is running and where.
+    pub sample_guest: Option<std::time::Duration>,
 }
 
 impl Default for Options {
@@ -184,6 +186,7 @@ impl Default for Options {
             fix_texture_min_filter: false,
             zero_stack_after_guest_to_host_call: None,
             trace_objc: Vec::new(),
+            sample_guest: None,
         }
     }
 }
@@ -401,6 +404,14 @@ impl Options {
             if self.trace_objc.is_empty() {
                 return Err("--trace-objc= requires at least one substring".to_string());
             }
+        } else if let Some(value) = arg.strip_prefix("--sample-guest=") {
+            let seconds: f32 = value
+                .parse()
+                .map_err(|_| "--sample-guest= requires a number of seconds".to_string())?;
+            if !(seconds.is_finite() && seconds > 0.0) {
+                return Err("--sample-guest= must be a positive number of seconds".to_string());
+            }
+            self.sample_guest = Some(std::time::Duration::from_secs_f32(seconds));
         } else if let Some(value) = arg.strip_prefix("--zero-stack-after-guest-to-host-call=") {
             self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()
