@@ -399,6 +399,11 @@ pub struct Dyld {
     thread_exit_routine: Option<GuestFunction>,
     constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static HostConstant)>,
     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
+    /// The other direction, so a guest address caught mid-execution can be
+    /// named. These trampolines live in guest memory, so a sample of the
+    /// program counter lands inside one whenever the guest is in a host
+    /// function, and an address there says nothing on its own.
+    host_function_names: HashMap<u32, &'static str>,
     /// How many times each `(pc, svc)` site has raised an SVC that maps to
     /// no host function, so the warning can be rate-limited. See
     /// [Self::get_svc_handler].
@@ -433,6 +438,7 @@ impl Dyld {
             thread_exit_routine: None,
             constants_to_link_later: Vec::new(),
             non_lazy_host_functions: HashMap::new(),
+            host_function_names: HashMap::new(),
             unexpected_svcs: HashMap::new(),
         }
     }
@@ -1730,7 +1736,19 @@ impl Dyld {
         let function_ptr: MutPtr<u32> = function_ptr.cast();
         mem.write(function_ptr + 0, encode_a32_svc(svc));
         mem.write(function_ptr + 1, encode_a32_ret());
+        self.host_function_names.insert(function_ptr.to_bits(), symbol);
         GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
+    }
+
+    /// The host function whose trampoline covers this address, if any.
+    ///
+    /// A trampoline is two instructions in guest memory, so an address caught
+    /// mid-execution is the entry or the return after it.
+    pub fn host_function_at(&self, addr: u32) -> Option<&'static str> {
+        self.host_function_names
+            .get(&(addr & !7))
+            .or_else(|| self.host_function_names.get(&((addr - 4) & !7)))
+            .copied()
     }
 }
 

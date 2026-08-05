@@ -1484,11 +1484,18 @@ impl Environment {
             };
             others.push_str(&format!(", {}: {}", tid, waiting));
         }
+        // A host function's trampoline lives in guest memory, so a sample can
+        // land inside one. The address means nothing; the name means
+        // everything, since it says what the guest is waiting on the host for.
+        let where_ = match self.dyld.host_function_at(pc) {
+            Some(name) => format!("{:#x} (host {})", pc, name),
+            None => format!("{:#x}", pc),
+        };
         log!(
-            "guest sample at {:.0}s: thread {} at {:#x}{}",
+            "guest sample at {:.0}s: thread {} at {}{}",
             elapsed,
             self.current_thread,
-            pc,
+            where_,
             others,
         );
     }
