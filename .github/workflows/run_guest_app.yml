@@ -127,7 +127,27 @@ jobs:
       - name: Build touchHLE
         run: cargo build --release
 
-      - name: Download the app
+      # An app is often a couple of gigabytes, and triage means running the
+      # same one over and over. Keep it between runs, both to save the twenty
+      # minutes and to stop pulling it from wherever it is hosted every time.
+      - name: Identify the app
+        id: app
+        env:
+          APP_URL: ${{ inputs.app_url }}
+        run: |
+          set -eu
+          key=$(printf '%s' "$APP_URL" | sha256sum | cut -c1-32)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Try to get a cached copy of the app
+        id: cache-app
+        uses: actions/cache@main
+        with:
+          path: downloaded_app
+          key: guest-app-${{ steps.app.outputs.key }}
+
+      - if: ${{ steps.cache-app.outputs.cache-hit != 'true' }}
+        name: Download the app
         shell: bash
         env:
           APP_URL: ${{ inputs.app_url }}
