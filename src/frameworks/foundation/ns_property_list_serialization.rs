@@ -189,25 +189,36 @@ pub(super) fn deserialize_plist_from_file(
     array_expected: bool,
 ) -> id {
     log_dbg!("Reading plist from {:?}.", path);
+    // These failures used to be debug-only, which meant a plist that could
+    // not be read came back as nil without a word about it anywhere. An app
+    // that then carries the nil around fails somewhere else entirely, with
+    // nothing in the log connecting the two.
     let Ok(bytes) = env.fs.read(path) else {
-        log_dbg!("Couldn't read file, returning nil.");
+        log!("Warning: couldn't read plist {:?}, returning nil.", path);
         return nil;
     };
 
     let root = match Value::from_reader(Cursor::new(bytes)) {
         Ok(root) => root,
         Err(err) => {
-            log_dbg!("Couldn't parse plist, returning nil: {}", err);
+            log!(
+                "Warning: couldn't parse plist {:?}, returning nil: {}",
+                path,
+                err
+            );
             return nil;
         }
     };
 
     if array_expected && root.as_array().is_none() {
-        log_dbg!("Plist root is not array, returning nil.");
+        log!("Warning: plist {:?} is not an array, returning nil.", path);
         return nil;
     }
     if !array_expected && root.as_dictionary().is_none() {
-        log_dbg!("Plist root is not dictionary, returning nil.");
+        log!(
+            "Warning: plist {:?} is not a dictionary, returning nil.",
+            path
+        );
         return nil;
     }
 
