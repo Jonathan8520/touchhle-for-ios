@@ -80,7 +80,10 @@ INDIRECT_SYMBOL_LOCAL = 0x80000000
 INDIRECT_SYMBOL_ABS = 0x40000000
 
 WINDOW_BEFORE = 0xC0
-WINDOW_AFTER = 0x40
+# Enough of what follows to read a whole small method. The address asked
+# about is usually the start of something, and 64 bytes of Thumb stops in
+# the middle of the first thing it does.
+WINDOW_AFTER = 0x180
 
 
 def die(message):
