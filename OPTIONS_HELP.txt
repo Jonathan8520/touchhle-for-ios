@@ -353,6 +353,20 @@ Other options:
         and adds a glGetError() round-trip per call, so it should not be
         left on for normal use.
 
+    --trace-objc=<substring>[,<substring>…]
+        For diagnostic builds. Log every Objective-C message whose
+        receiver's class name or whose selector contains one of the given
+        substrings, matched case-insensitively, together with the address
+        of the method implementation the message reached.
+        An app's own classes are guest code, so without this the emulator's
+        log shows only the framework calls an app makes and never the app's
+        own control flow. --trace-objc=eagl,surface shows, in order, every
+        message involved in setting up a drawing surface; the guest
+        addresses in the output are what dev-scripts/disassemble-guest.py
+        takes as arguments.
+        --trace-objc=all logs every message, which is far too much output
+        for more than a few seconds of a run.
+
     --fix-texture-min-filter
         Workaround for apps that rely on the default ES 1.1
         GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable

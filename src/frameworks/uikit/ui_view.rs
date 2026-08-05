@@ -201,6 +201,20 @@ fn init_common(env: &mut Environment, this: id) -> id {
     let view_class: Class = msg![env; this class];
     let layer_class: Class = msg![env; view_class layerClass];
     let layer: id = msg![env; layer_class layer];
+    // A view whose layer is nil draws nothing and answers every question
+    // about its layer with zero, which looks like a view that simply has
+    // nothing to show. This happens when `+layerClass` names a class touchHLE
+    // does not implement — `+[CAMetalLayer class]` is nil here, for one — so
+    // say which class was asked for.
+    if layer == nil {
+        log!(
+            "Warning: +[{} layerClass] gave {:?}, so {:?} has no layer and will \
+             never draw. touchHLE probably does not implement that layer class.",
+            env.objc.get_class_name(view_class),
+            layer_class,
+            this,
+        );
+    }
     () = msg![env; layer setDelegate:this];
     () = msg![env; layer setOpaque:true];
     crate::frameworks::core_animation::ca_layer::set_use_implicit_animations(env, layer, false);
@@ -1971,9 +1985,16 @@ pub fn set_needs_layout(env: &mut Environment, view: id) {
         return;
     }
     let dirty = &mut env.framework_state.uikit.ui_view.needing_layout;
-    if !dirty.contains(&view) {
-        dirty.push(view);
+    if dirty.contains(&view) {
+        return;
     }
+    dirty.push(view);
+    // The list outlives the call that filled it, so it has to own what it
+    // holds. Without this a view released between being marked and being laid
+    // out leaves a dangling pointer behind, and because touchHLE hands the
+    // same address to the next allocation, the layout pass then sends
+    // `-layoutSubviews` to whatever object took its place.
+    retain(env, view);
 }
 
 /// How many superviews are above this one, for ordering the layout pass.
@@ -2003,12 +2024,10 @@ pub fn perform_pending_layout(env: &mut Environment) {
     if env.framework_state.uikit.ui_view.needing_layout.is_empty() {
         return;
     }
+    // Each entry carries a reference taken by `set_needs_layout`, which is
+    // what keeps the rest of the list valid while a guest `-layoutSubviews`
+    // tears other views down. This pass hands those references back.
     let mut dirty = std::mem::take(&mut env.framework_state.uikit.ui_view.needing_layout);
-    // Retain across the pass: a guest `-layoutSubviews` is free to tear down
-    // other views, and one of them could be later in this list.
-    for &view in &dirty {
-        retain(env, view);
-    }
     dirty.sort_by_key(|&view| view_depth(env, view));
     for view in dirty {
         // What a view is laid out with decides what its `-layoutSubviews`

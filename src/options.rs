@@ -129,6 +129,19 @@ pub struct Options {
     /// mipmaps are unaffected.
     pub fix_texture_min_filter: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
+    /// Log every Objective-C message whose receiver's class name or whose
+    /// selector contains one of these (lowercased) substrings.
+    ///
+    /// An app's own classes are guest code, so the only thing the emulator
+    /// normally sees of them is an address. This makes the app's control flow
+    /// readable: `--trace-objc=eagl,surface` shows, in order, every message
+    /// that has anything to do with setting up a drawing surface, and the
+    /// address of the guest method each one reached. That address is what
+    /// `dev-scripts/disassemble-guest.py` needs.
+    ///
+    /// A single empty string means "everything", which is only useful for a
+    /// few seconds of a run.
+    pub trace_objc: Vec<String>,
 }
 
 impl Default for Options {
@@ -170,6 +183,7 @@ impl Default for Options {
             trace_gl_errors: false,
             fix_texture_min_filter: false,
             zero_stack_after_guest_to_host_call: None,
+            trace_objc: Vec::new(),
         }
     }
 }
@@ -374,6 +388,19 @@ impl Options {
             self.trace_gl_errors = true;
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
+        } else if let Some(value) = arg.strip_prefix("--trace-objc=") {
+            self.trace_objc = if value == "all" {
+                vec![String::new()]
+            } else {
+                value
+                    .split(',')
+                    .map(|pattern| pattern.trim().to_lowercase())
+                    .filter(|pattern| !pattern.is_empty())
+                    .collect()
+            };
+            if self.trace_objc.is_empty() {
+                return Err("--trace-objc= requires at least one substring".to_string());
+            }
         } else if let Some(value) = arg.strip_prefix("--zero-stack-after-guest-to-host-call=") {
             self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()

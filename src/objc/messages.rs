@@ -23,6 +23,55 @@ use crate::mem::{ConstPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::Environment;
 use std::any::TypeId;
 
+/// Log one message dispatch for `--trace-objc`, if it matches what was asked
+/// for.
+///
+/// The address of a guest implementation is the point of this: an app's own
+/// classes are guest code, so a trace that only named them would say what the
+/// app did but give nothing to look at afterwards.
+fn trace_message(
+    patterns: &[String],
+    receiver: id,
+    selector_name: &str,
+    receiver_class_name: &str,
+    implementing_class_name: &str,
+    imp: &IMP,
+) {
+    let matches = patterns.iter().any(|pattern| {
+        pattern.is_empty()
+            || selector_name.to_lowercase().contains(pattern)
+            || receiver_class_name.to_lowercase().contains(pattern)
+    });
+    if !matches {
+        return;
+    }
+
+    // Where the method was found only matters when it is not the receiver's
+    // own class, and saying so every time would bury that.
+    let inherited = if implementing_class_name == receiver_class_name {
+        String::new()
+    } else {
+        format!(" (inherited from {})", implementing_class_name)
+    };
+    match imp {
+        IMP::Host(_) => log!(
+            "objc trace: [<{} {:?}> {}]{} -> host",
+            receiver_class_name,
+            receiver,
+            selector_name,
+            inherited,
+        ),
+        IMP::Guest(guest_imp) => log!(
+            "objc trace: [<{} {:?}> {}]{} -> guest {:#x}",
+            receiver_class_name,
+            receiver,
+            selector_name,
+            inherited,
+            guest_imp.addr_without_thumb_bit(),
+        ),
+    }
+}
+
 /// Implements Apple's lazy `+initialize` contract:
 /// > The runtime sends `initialize` to each class in a program just before the
 /// > class, or any class that inherits from it, is sent its first message from
@@ -207,6 +256,20 @@ fn objc_msgSend_inner(
     if receiver == nil {
         // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjectiveC/Chapters/ocObjectsClasses.html#//apple_ref/doc/uid/TP30001163-CH11-SW7
         log_dbg!("[nil {}]", selector.as_str(&env.mem));
+        // A message to nil is silently a no-op, which is exactly what makes a
+        // nil that should not be nil so hard to find. Show it, since a trace
+        // that skipped these would show the app doing nothing at all.
+        if !env.options.trace_objc.is_empty() {
+            let selector_name = selector.as_str(&env.mem);
+            if env
+                .options
+                .trace_objc
+                .iter()
+                .any(|pattern| pattern.is_empty() || selector_name.to_lowercase().contains(pattern))
+            {
+                log!("objc trace: [nil {}]", selector_name);
+            }
+        }
         env.cpu.regs_mut()[0..2].fill(0);
         return;
     }
@@ -557,6 +620,16 @@ fn objc_msgSend_inner(
 
             if let Some(imp) = methods.get(&selector) {
                 log_dbg!("Found method on: {}", name);
+                if !env.options.trace_objc.is_empty() {
+                    trace_message(
+                        &env.options.trace_objc,
+                        receiver,
+                        selector.as_str(&env.mem),
+                        env.objc.get_class_name(orig_class),
+                        name,
+                        imp,
+                    );
+                }
                 match imp {
                     IMP::Host(host_imp) => {
                         // TODO: do type checks when calling GuestIMPs too.

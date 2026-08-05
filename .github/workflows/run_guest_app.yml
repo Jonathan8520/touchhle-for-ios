@@ -335,6 +335,17 @@ jobs:
             tail -300 run.log
           fi
           echo
+          # An `--trace-objc` run puts what the app actually did in the
+          # middle of the log, which is the part the head/tail above drops.
+          if grep -aq 'objc trace:' run.log; then
+            echo "===== objc trace (first 400 lines) ====="
+            grep -a 'objc trace:' run.log | head -400
+            echo "===== objc trace: how often each message was sent ====="
+            grep -a 'objc trace:' run.log \
+              | sed -E 's/ 0x[0-9a-fA-F]+>/>/' \
+              | sort | uniq -c | sort -rn | head -60
+            echo
+          fi
           # These two go last, so that they are what you see first when
           # reading the job output from the end.
           echo "===== what led up to the first null-page access ====="
