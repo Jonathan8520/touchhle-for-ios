@@ -399,6 +399,10 @@ pub struct Dyld {
     thread_exit_routine: Option<GuestFunction>,
     constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static HostConstant)>,
     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
+    /// How many times each `(pc, svc)` site has raised an SVC that maps to
+    /// no host function, so the warning can be rate-limited. See
+    /// [Self::get_svc_handler].
+    unexpected_svcs: HashMap<(u32, u32), u64>,
 }
 
 impl Dyld {
@@ -429,6 +433,7 @@ impl Dyld {
             thread_exit_routine: None,
             constants_to_link_later: Vec::new(),
             non_lazy_host_functions: HashMap::new(),
+            unexpected_svcs: HashMap::new(),
         }
     }
 
@@ -1432,10 +1437,29 @@ impl Dyld {
                         as usize,
                 );
                 let Some(&(symbol, f)) = f else {
-                    log!(
-                        "Warning: Unexpected SVC #{} at {:#x}; treating as no-op (returning to caller).",
-                        svc, svc_pc
-                    );
+                    // Darwin makes system calls with `svc #0x80`, which is
+                    // SVC #128 — inside the range touchHLE hands out for its
+                    // own host functions. A guest that makes a raw syscall
+                    // therefore arrives here, nothing happens, and it
+                    // usually arrives again immediately: Disney Infinity Toy
+                    // Box 2.0 spins on one site eleven million times in two
+                    // minutes. Report the first occurrence and then
+                    // successive powers of two, which keeps a runaway site
+                    // to a couple of dozen lines. On a real `svc #0x80` r12
+                    // holds the syscall number.
+                    let count = self.unexpected_svcs.entry((svc_pc, svc)).or_insert(0);
+                    *count += 1;
+                    if count.is_power_of_two() {
+                        log!(
+                            "Warning: Unexpected SVC #{} at {:#x} (r12={:#x}, which is the \
+                             syscall number if this is a raw Darwin `svc #0x80`); treating as \
+                             no-op (returning to caller). [occurrence {}]",
+                            svc,
+                            svc_pc,
+                            cpu.regs()[12],
+                            count
+                        );
+                    }
                     return None;
                 };
                 log_dbg!("Call to host function, already linked: {}", symbol);
