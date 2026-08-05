@@ -867,22 +867,32 @@ def data_references(data, targets):
     return hits
 
 
-def objc_method_at(data, imp_address):
-    """The selector and type encoding of the method whose IMP is here.
+def objc_method_at(data, address):
+    """Describe an address in __objc_const as a field of a method_t.
 
-    A 32-bit ObjC2 method_t is {SEL name; const char *types; IMP imp}, so
-    a function address found in __objc_const is the third word of one and
-    the two before it name it. That is how a function nothing branches to
-    turns out to be a method."""
-    name_pointer = read_word(data, imp_address - 8)
-    types_pointer = read_word(data, imp_address - 4)
+    A 32-bit ObjC2 method_t is {SEL name; const char *types; IMP imp}.
+    Which of the three an address is can be told from what it holds: the
+    first two hold strings, the third holds code. Reading every hit as an
+    IMP would take a `name` field and print the *previous* method's type
+    encoding as if it were a selector."""
+    value = read_word(data, address)
+    if not value:
+        return None
+    text = c_string_at(data, value, limit=256)
+    if text is not None:
+        return "a method_t field holding {!r}".format(text)
+
+    name_pointer = read_word(data, address - 8)
+    types_pointer = read_word(data, address - 4)
     if not name_pointer or not types_pointer:
         return None
     selector = c_string_at(data, name_pointer, limit=256)
-    types = c_string_at(data, types_pointer, limit=64)
     if selector is None:
         return None
-    return selector, types
+    types = c_string_at(data, types_pointer, limit=64)
+    return "the IMP of a method named {!r}{}".format(
+        selector, " (types {!r})".format(types) if types else ""
+    )
 
 
 def report_data_references(data, targets):
@@ -897,12 +907,9 @@ def report_data_references(data, targets):
         for segment, name, at in sorted(found, key=lambda hit: hit[2]):
             note = ""
             if name == "__objc_const":
-                method = objc_method_at(data, at)
-                if method is not None:
-                    selector, types = method
-                    note = "   the IMP of a method named {!r}{}".format(
-                        selector, " (types {!r})".format(types) if types else ""
-                    )
+                described = objc_method_at(data, at)
+                if described is not None:
+                    note = "   " + described
             print("{:#010x}  in {},{}{}".format(at, segment, name, note))
 
 
