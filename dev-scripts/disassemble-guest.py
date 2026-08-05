@@ -623,6 +623,7 @@ def xref(capstone, data, targets):
         sweep_section(capstone, code, section, found, wanted)
 
     report_xrefs(data, targets, found)
+    report_data_references(data, targets)
 
 
 def iter_code(capstone, data, detail=True):
@@ -830,6 +831,53 @@ def sweep_section(capstone, code, section, found, wanted):
         "  {} restart(s) over undecodable bytes".format(restarts),
         file=sys.stderr,
     )
+
+
+def data_references(data, targets):
+    """Every aligned word in the file equal to a target, and where it is.
+
+    A function that no branch names can still be reached: through a
+    `__mod_init_func` entry, an Objective-C method list, a vtable, any
+    table of pointers at all. None of those are code, so no disassembly
+    finds them — but the address is sitting there as a word, and a
+    function pointer carries the Thumb bit, so both spellings count."""
+    import re
+
+    wanted = {}
+    for target in targets:
+        wanted[target] = target
+        wanted[target | 1] = target
+    hits = {target: [] for target in targets}
+
+    for section in sections(data):
+        if section["type"] in ZEROFILL_SECTION_TYPES or not section["size"]:
+            continue
+        offset = file_offset(data, section["addr"])
+        if offset is None:
+            continue
+        end = min(offset + section["size"], len(data))
+        for value, target in wanted.items():
+            needle = struct.pack("<I", value)
+            for match in re.finditer(re.escape(needle), data[offset:end]):
+                if match.start() % 4:
+                    continue
+                hits[target].append(
+                    (section["segment"], section["name"], section["addr"] + match.start())
+                )
+    return hits
+
+
+def report_data_references(data, targets):
+    hits = data_references(data, targets)
+    for target in targets:
+        print()
+        print("=== the address {:#x} stored as data ===".format(target))
+        found = hits[target]
+        if not found:
+            print("(nowhere — no pointer table in the binary holds it)")
+            continue
+        for segment, name, at in sorted(found, key=lambda hit: hit[2]):
+            print("{:#010x}  in {},{}".format(at, segment, name))
 
 
 def report_xrefs(data, targets, found):
