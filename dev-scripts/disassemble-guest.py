@@ -539,6 +539,26 @@ def annotate(capstone, data, instruction, thumb, known, from_slot):
     return None
 
 
+def function_start(capstone, instructions, address):
+    """The last `push {..., lr}` at or before `address`.
+
+    Not authoritative — a function can begin in other ways — but for
+    compiled Thumb it is almost always the prologue, and it is the address
+    to hand to --xref to find who calls this code."""
+    best = None
+    for instruction in instructions:
+        if instruction.address > address:
+            break
+        if instruction.mnemonic.startswith("push"):
+            for operand in instruction.operands:
+                if (
+                    operand.type == capstone.arm.ARM_OP_REG
+                    and operand.reg == capstone.arm.ARM_REG_LR
+                ):
+                    best = instruction.address
+    return best
+
+
 def disassemble_window(md, data, address, thumb):
     """Instructions around `address`, decoded from a start that lands on it.
 
@@ -771,6 +791,13 @@ def main(argv):
         if not instructions:
             print("(nothing decodable around this address)")
             continue
+        entry = function_start(capstone, instructions, address)
+        if entry is not None and entry != address:
+            print(
+                "prologue at {:#x} — pass {:#x} to --xref to find the callers".format(
+                    entry, entry | 1 if thumb else entry
+                )
+            )
         known, from_slot = {}, {}
         for instruction in instructions:
             note = annotate(capstone, data, instruction, thumb, known, from_slot)
