@@ -20,9 +20,10 @@
 //! callbacks (e.g. `MFMailComposeViewController` completion handlers,
 //! `dispatch_async`) link and run.
 
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstVoidPtr, MutVoidPtr, Ptr};
-use crate::objc::{id, release, retain};
+use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
+use crate::objc::{id, nil, release, retain};
 use crate::Environment;
 
 /// Bit-flag values passed to `_Block_object_assign` / `_Block_object_dispose`.
@@ -88,6 +89,74 @@ fn _Block_object_dispose(env: &mut Environment, object: ConstVoidPtr, flags: i32
         release(env, obj);
     }
     // BLOCK_FIELD_IS_BYREF: caller manages.
+}
+
+// MARK: - Helpers for host code that has to hold on to, or call, a block
+
+/// Word offset of a block literal's `invoke` function pointer. The layout is
+/// `{ isa, flags, reserved, invoke, descriptor, captured variables… }`, and
+/// every field before `invoke` is one word wide on 32-bit ARM, so `invoke` is
+/// the fourth word. See the
+/// [Blocks ABI](https://clang.llvm.org/docs/Block-ABI-Apple.html).
+pub const BLOCK_INVOKE_WORD_OFFSET: u32 = 3;
+
+/// Read a block's `invoke` function pointer.
+///
+/// Returns [None] for a nil block, or for one whose `invoke` pointer is zero.
+/// The latter happens when the guest hands over a stack block that was never
+/// copied and has already gone out of scope, so callers should treat it as
+/// "there is nothing to call" rather than as a fatal error.
+pub fn block_invoke(env: &Environment, block: id) -> Option<GuestFunction> {
+    if block == nil {
+        return None;
+    }
+    let block_ptr: MutPtr<u32> = Ptr::from_bits(block.to_bits());
+    let invoke_addr: u32 = env.mem.read(block_ptr + BLOCK_INVOKE_WORD_OFFSET);
+    if invoke_addr == 0 {
+        return None;
+    }
+    Some(GuestFunction::from_addr_with_thumb_bit(invoke_addr))
+}
+
+/// Call a block whose underlying function has the signature `void (^)(void)`.
+/// Does nothing if there is no function to call.
+pub fn invoke_void_block(env: &mut Environment, block: id) {
+    let Some(invoke) = block_invoke(env, block) else {
+        return;
+    };
+    let block_arg: ConstVoidPtr = Ptr::from_bits(block.to_bits());
+    <GuestFunction as CallFromHost<(), (ConstVoidPtr,)>>::call_from_host(
+        &invoke,
+        env,
+        (block_arg,),
+    );
+}
+
+/// `Block_copy()` for host code that needs to keep a block past the call it
+/// was handed to. The returned block is owned by the caller and must be
+/// passed to [block_release] when it is no longer needed.
+///
+/// This is the same operation the guest gets from `_Block_copy`, with the
+/// same limitation: it does not yet promote a stack block to the heap, so a
+/// block that has gone out of scope by the time it is called is still gone.
+/// Routing through here rather than copying pointers around means callers
+/// pick up a real implementation for free if one is added.
+pub fn block_copy(env: &mut Environment, block: id) -> id {
+    if block == nil {
+        return nil;
+    }
+    let block_ptr: MutVoidPtr = Ptr::from_bits(block.to_bits());
+    let copied = _Block_copy(env, block_ptr.cast_const());
+    Ptr::from_bits(copied.to_bits())
+}
+
+/// `Block_release()`, pairing with [block_copy].
+pub fn block_release(env: &mut Environment, block: id) {
+    if block == nil {
+        return;
+    }
+    let block_ptr: MutVoidPtr = Ptr::from_bits(block.to_bits());
+    _Block_release(env, block_ptr.cast_const());
 }
 
 pub const FUNCTIONS: FunctionExports = &[

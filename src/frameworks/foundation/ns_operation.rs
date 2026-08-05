@@ -4,11 +4,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use super::ns_array;
 use super::ns_string::get_static_str;
+use crate::libc::blocks::{block_copy, block_release, invoke_void_block};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr, SEL,
 };
+use crate::Environment;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
@@ -40,6 +43,11 @@ struct NSOperationHostObject {
     selector: Option<SEL>,
     arg: id,
     invocation: id,
+
+    // NSBlockOperation specific field: the blocks to run in -main, in the
+    // order they were added. Each one is owned by this object: copied on the
+    // way in, released in -dealloc.
+    execution_blocks: Vec<id>,
 }
 
 
@@ -51,9 +59,87 @@ struct NSOperationQueueHostObject {
     suspended: bool,
     max_concurrent_operations: i32,
     name: id,
+    /// Set while [drain_queue] is running, so that an operation which adds
+    /// more work to its own queue doesn't recurse into it.
+    draining: bool,
 }
 
 impl HostObject for NSOperationQueueHostObject {}
+
+/// Run everything in `queue` that is ready to run, and take the operations
+/// that finished back out of it.
+///
+/// touchHLE runs the guest on a single thread, so there is no worker to hand
+/// an operation to: whatever can run, runs here and now. The loop is needed
+/// because finishing one operation can satisfy another's dependency, and
+/// because an operation is allowed to add more work to its own queue.
+fn drain_queue(env: &mut Environment, queue: id) {
+    {
+        let host_object = env.objc.borrow_mut::<NSOperationQueueHostObject>(queue);
+        if host_object.suspended || host_object.draining {
+            return;
+        }
+        host_object.draining = true;
+    }
+
+    // An operation is free to release the queue that is running it, so keep
+    // the queue alive for as long as this function needs it.
+    retain(env, queue);
+
+    loop {
+        // Re-read the operation list every pass: running one operation can
+        // have changed it.
+        let operations = env
+            .objc
+            .borrow::<NSOperationQueueHostObject>(queue)
+            .operations;
+        let count: usize = msg![env; operations count];
+
+        let mut next = nil;
+        for i in 0..count {
+            let op: id = msg![env; operations objectAtIndex:i];
+            if op == nil {
+                continue;
+            }
+            let is_finished: bool = msg![env; op isFinished];
+            let is_executing: bool = msg![env; op isExecuting];
+            let is_ready: bool = msg![env; op isReady];
+            if is_ready && !is_executing && !is_finished {
+                next = op;
+                break;
+            }
+        }
+        if next == nil {
+            break;
+        }
+
+        // Keep the operation alive across -start: it is removed from the
+        // array, which owns the only other reference, right afterwards.
+        retain(env, next);
+        () = msg![env; next start];
+        let is_finished: bool = msg![env; next isFinished];
+        if is_finished {
+            () = msg![env; operations removeObject:next];
+        }
+        release(env, next);
+
+        // -start always drives a ready operation to isFinished (a cancelled
+        // one included), so each pass removes one operation and the loop
+        // terminates. Bail out anyway rather than spin if that ever changes.
+        if !is_finished {
+            log!(
+                "Warning: NSOperationQueue: operation {:?} did not finish; leaving it queued",
+                next
+            );
+            break;
+        }
+    }
+
+    env.objc
+        .borrow_mut::<NSOperationQueueHostObject>(queue)
+        .draining = false;
+    release(env, queue);
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -73,8 +159,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())dealloc {
     // Extract all properties to temporary variables to avoid borrow checker
     // conflicts
-    let (deps, completion, name, target, arg, invocation) = {
-        let host_object = env.objc.borrow::<NSOperationHostObject>(this);
+    let (deps, completion, name, target, arg, invocation, blocks) = {
+        let host_object = env.objc.borrow_mut::<NSOperationHostObject>(this);
         (
             host_object.dependencies,
             host_object.completion_block,
@@ -82,15 +168,22 @@ pub const CLASSES: ClassExports = objc_classes! {
             host_object.target,
             host_object.arg,
             host_object.invocation,
+            std::mem::take(&mut host_object.execution_blocks),
         )
     };
 
     release(env, deps);
-    release(env, completion);
     release(env, name);
     release(env, target);
     release(env, arg);
     release(env, invocation);
+
+    // Blocks are not Objective-C objects in touchHLE, so they are released
+    // through the Blocks runtime rather than with -release.
+    block_release(env, completion);
+    for block in blocks {
+        block_release(env, block);
+    }
 
     env.objc.dealloc_object(this, &mut env.mem)
 }
@@ -150,12 +243,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this didChangeValueForKey:executing_str_2];
     () = msg![env; this didChangeValueForKey:finished_str];
 
-    // Call completion block if present
+    // Call completion block if present. It is a `void (^)(void)` block, not
+    // an object with an -invoke method, so it is called through the Blocks
+    // ABI.
     let completion = env.objc.borrow::<NSOperationHostObject>(this).completion_block;
-    if completion != nil {
-        // Invoke the block
-        let _: () = msg![env; completion invoke];
-    }
+    invoke_void_block(env, completion);
 }
 
 - (())main {
@@ -277,11 +369,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setCompletionBlock:(id)block {
     let old_block = env.objc.borrow::<NSOperationHostObject>(this).completion_block;
-    release(env, old_block);
+    block_release(env, old_block);
 
-    if block != nil {
-        retain(env, block);
-    }
+    // Apple's contract: the block is run after the operation finishes, which
+    // can be long after the caller's stack frame is gone, so it is copied.
+    let block = block_copy(env, block);
     env.objc.borrow_mut::<NSOperationHostObject>(this).completion_block = block;
 }
 
@@ -394,8 +486,50 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation NSBlockOperation: NSOperation
 
-// TODO: Implement NSBlockOperation with block storage and execution
-// This would require proper block support in the HLE
+// allocWithZone: and dealloc are inherited from NSOperation, which owns the
+// execution block storage.
+
++ (id)blockOperationWithBlock:(id)block {
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new init];
+    () = msg![env; new addExecutionBlock:block];
+    autorelease(env, new)
+}
+
+- (())addExecutionBlock:(id)block {
+    if block == nil {
+        return;
+    }
+    // The operation can be run long after the method that built it returned,
+    // so the block must not be left in the caller's stack frame.
+    let block = block_copy(env, block);
+    env.objc.borrow_mut::<NSOperationHostObject>(this).execution_blocks.push(block);
+}
+
+- (id)executionBlocks {
+    // The array holds the same blocks this operation owns. It can't hold its
+    // own references to them: a block is not an Objective-C object here, so
+    // the -retain and -release the array does are no-ops on one.
+    let blocks = env.objc.borrow::<NSOperationHostObject>(this).execution_blocks.clone();
+    let array = ns_array::from_vec(env, blocks);
+    autorelease(env, array)
+}
+
+- (())main {
+    // Check for cancellation
+    let cancelled = env.objc.borrow::<NSOperationHostObject>(this).cancelled;
+    if cancelled {
+        return;
+    }
+
+    // Apple documents the blocks of one NSBlockOperation as possibly running
+    // concurrently; with a single guest thread they run in the order they
+    // were added, which is a valid ordering of that.
+    let blocks = env.objc.borrow::<NSOperationHostObject>(this).execution_blocks.clone();
+    for block in blocks {
+        invoke_void_block(env, block);
+    }
+}
 
 @end
 
@@ -448,23 +582,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    retain(env, op);
-
     let operations = env.objc.borrow::<NSOperationQueueHostObject>(this).operations;
     () = msg![env; operations addObject:op];
 
-    // Execute immediately if not suspended
-    let suspended = env.objc.borrow::<NSOperationQueueHostObject>(this).suspended;
-    if !suspended {
-        let is_ready: bool = msg![env; op isReady];
-        if is_ready {
-            () = msg![env; op start];
-        }
-    }
-
-    // Remove from queue after execution
-    () = msg![env; operations removeObject:op];
-    release(env, op);
+    // Runs the operation right away unless the queue is suspended or a
+    // dependency is unfinished, in which case it stays queued until
+    // -setSuspended:NO or -waitUntilAllOperationsAreFinished. It used to be
+    // taken back out of the queue whether or not it had run, which lost the
+    // work of anything added to a suspended queue.
+    drain_queue(env, this);
 }
 
 - (())addOperations:(id)ops waitUntilFinished:(bool)wait {
@@ -488,8 +614,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    log!("Warning: NSOperationQueue addOperationWithBlock: requires NSBlockOperation support");
-    // Would create an NSBlockOperation and add it
+    let op: id = msg_class![env; NSBlockOperation blockOperationWithBlock:block];
+    () = msg![env; this addOperation:op];
 }
 
 // MARK: - Queue control
@@ -497,23 +623,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setSuspended:(bool)suspended {
     env.objc.borrow_mut::<NSOperationQueueHostObject>(this).suspended = suspended;
 
-    // If resuming, start ready operations
+    // If resuming, run whatever was queued while suspended.
     if !suspended {
-        let operations = env.objc.borrow::<NSOperationQueueHostObject>(this).operations;
-        let count: usize = msg![env; operations count];
-
-        for i in 0..count {
-            let op: id = msg![env; operations objectAtIndex:i];
-            if op != nil {
-                let is_ready: bool = msg![env; op isReady];
-                let is_executing: bool = msg![env; op isExecuting];
-                let is_finished: bool = msg![env; op isFinished];
-
-                if is_ready && !is_executing && !is_finished {
-                    () = msg![env; op start];
-                }
-            }
-        }
+        drain_queue(env, this);
     }
 }
 
@@ -541,14 +653,22 @@ pub const CLASSES: ClassExports = objc_classes! {
             () = msg![env; op cancel];
         }
     }
+
+    // A cancelled operation still has to be started to reach isFinished, so
+    // that it leaves the queue and its dependents stop waiting on it.
+    drain_queue(env, this);
 }
 
 // MARK: - Waiting
 
 - (())waitUntilAllOperationsAreFinished {
-    // In HLE, operations are synchronous, so this is effectively a no-op
-    // All operations added to the queue have already finished by the time
-    // addOperation: returns
+    // Operations are synchronous here, so anything that could run already
+    // has by the time -addOperation: returned. What may be left is work that
+    // was queued while suspended, or that was waiting on a dependency, so
+    // run that now. A queue that is still suspended keeps its operations:
+    // real NSOperationQueue would block forever, which is not something
+    // touchHLE can usefully reproduce.
+    drain_queue(env, this);
 }
 
 // MARK: - Properties
