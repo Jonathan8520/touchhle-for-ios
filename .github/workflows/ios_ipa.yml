@@ -234,6 +234,9 @@ jobs:
         uses: softprops/action-gh-release@master
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}
+          # A tag the action has to create itself would otherwise be placed on
+          # the default branch, not on the commit that was actually built.
+          target_commitish: ${{ github.sha }}
           draft: false
           prerelease: true
           fail_on_unmatched_files: true
