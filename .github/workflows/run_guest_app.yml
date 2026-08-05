@@ -1,0 +1,158 @@
+name: Run a guest app
+
+# Manually-triggered compatibility triage: builds touchHLE for Linux, runs a
+# guest app under it for a bounded time on a headless runner, and uploads the
+# emulator log.
+#
+# This exists so a compatibility fix can be checked without a device. The
+# `build_ref` input builds a different revision of the emulator from the one
+# the workflow file came from, which is what makes a before/after comparison
+# of the same app possible.
+#
+# No app is named here and none is committed: the link is a dispatch input.
+# Only use apps you obtained legally.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: Direct link to a decrypted .ipa, or an archive.org item page
+        type: string
+        required: true
+      build_ref:
+        description: Revision of touchHLE to build (defaults to the dispatch ref)
+        type: string
+        required: false
+      run_seconds:
+        description: How long to let the app run before stopping it (seconds)
+        type: string
+        required: false
+        default: "120"
+      extra_args:
+        description: Extra arguments for touchHLE (e.g. "--scale-hack=2")
+        type: string
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  run-guest-app:
+    name: Run on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout touchHLE
+        uses: actions/checkout@main
+        with:
+          submodules: recursive
+          ref: ${{ inputs.build_ref }}
+
+      - name: Report the revision under test
+        run: git log -1 --format='%H %s'
+
+      - name: Install Linux build and runtime dependencies
+        # SDL2 and openal-soft are built from source, so the development
+        # headers for the backends they detect must be available. `xvfb`
+        # provides a headless X server and `libgl1-mesa-dri` the llvmpipe
+        # software renderer, since the runner has no GPU.
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential \
+            pkg-config \
+            libasound2-dev \
+            libpulse-dev \
+            libsndio-dev \
+            libdbus-1-dev \
+            libudev-dev \
+            libx11-dev \
+            libxext-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxss-dev \
+            libxxf86vm-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dri \
+            xvfb
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@master
+
+      - name: Try to get cached copy of Boost
+        id: cache-boost
+        uses: actions/cache@main
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_linux
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download and extract Boost
+        run: |
+          curl -L --retry 4 --retry-delay 2 -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+          mkdir -p vendor
+          tar xzf boost_1_81_0.tar.gz -C vendor
+          mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.29.0"
+
+      - name: Build touchHLE
+        run: cargo build --release
+
+      - name: Download the app
+        shell: bash
+        env:
+          APP_URL: ${{ inputs.app_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloaded_app
+          url=$APP_URL
+          # An archive.org item page is not a file. Ask the metadata API which
+          # files the item holds and take the first .ipa.
+          case "$url" in
+            *archive.org/details/*)
+              identifier=${url##*/details/}
+              identifier=${identifier%%/*}
+              identifier=${identifier%%\?*}
+              echo "Resolving archive.org item $identifier"
+              curl -fL --retry 4 --retry-delay 2 \
+                -o metadata.json "https://archive.org/metadata/$identifier"
+              url=$(python3 -c 'import json, sys, urllib.parse; files = json.load(open("metadata.json")).get("files", []); names = [f["name"] for f in files if f.get("name", "").lower().endswith(".ipa")]; sys.exit("No .ipa in the item file list") if not names else None; print("https://archive.org/download/" + sys.argv[1] + "/" + urllib.parse.quote(names[0]))' "$identifier")
+              ;;
+          esac
+          echo "Downloading $url"
+          curl -fL --retry 4 --retry-delay 2 -o downloaded_app/app.ipa "$url"
+          ls -lh downloaded_app/app.ipa
+
+      - name: Inspect the app bundle
+        run: ./target/release/touchHLE downloaded_app/app.ipa --info
+
+      - name: Run the app under touchHLE
+        shell: bash
+        env:
+          RUN_SECONDS: ${{ inputs.run_seconds }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+        run: |
+          set -uo pipefail
+          xvfb-run -a --server-args="-screen 0 640x960x24" \
+            ./dev-scripts/ci-run-app.sh ./target/release/touchHLE \
+            "${RUN_SECONDS}" downloaded_app/app.ipa ${EXTRA_ARGS}
+
+      - name: Upload the run log
+        if: always()
+        uses: actions/upload-artifact@main
+        with:
+          name: guest_app_run_log
+          path: run.log
+          if-no-files-found: ignore

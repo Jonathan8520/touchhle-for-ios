@@ -253,19 +253,39 @@ export DEVELOPER_DIR="/Applications/Xcode-beta.app/Contents/Developer"
 ### Unsigned Release Build
 
 ```sh
+sh platform/ios/scripts/build-sdl-shared.sh iphoneos
 sh platform/ios/scripts/build-host.sh iphoneos Release
 sh platform/ios/scripts/package-ipa.sh
+sh platform/ios/scripts/verify-ipa.sh
 ```
+
+SDL2 comes first: the host app and every core link against one shared copy
+embedded in the bundle, and the core build stops if it is missing.
 
 The outputs are:
 
 ```text
 build/host-iphoneos/Build/Products/Release-iphoneos/touchHLE.app
-dist/touchHLE-iOS-unsigned.ipa
-dist/touchHLE-iOS-unsigned.ipa.sha256
+dist/touchHLE-HyperHLE-iOS-unsigned.ipa
+dist/touchHLE-HyperHLE-iOS-unsigned.ipa.sha256
 ```
 
-The packaging script refuses to package a signed app.
+The packaging script refuses to package a signed app, and `verify-ipa.sh`
+re-checks the finished IPA for signing material and for local paths.
+
+### Building The IPA Without A Mac
+
+The **Build iOS IPA** GitHub Actions workflow
+(`.github/workflows/ios_ipa.yml`) runs exactly that sequence on a macOS
+runner and uploads the unsigned IPA as a build artifact, so a build can be
+produced from a fork without owning a Mac. It runs on pushes to the port
+branches and on pull requests; pushing a tag matching `ios-v*` also attaches
+the IPA to a GitHub release.
+
+The runner has no certificate, profile or team, so what it produces is
+unsigned by construction — which is what the packaging script requires
+anyway. Signing still happens locally, on your own machine, with your own
+Apple account.
 
 ### Simulator Build
 
