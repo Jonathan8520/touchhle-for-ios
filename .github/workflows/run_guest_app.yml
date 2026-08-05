@@ -190,7 +190,25 @@ jobs:
           ls -lh downloaded_app/app.ipa
 
       - name: Inspect the app bundle
-        run: ./target/release/touchHLE downloaded_app/app.ipa --info
+        run: |
+          set -euo pipefail
+          ./target/release/touchHLE downloaded_app/app.ipa --info
+          # Apps gate startup work on their own Info.plist — the supported
+          # orientations in particular — so show what this one declares.
+          python3 - <<'PY'
+          import plistlib, zipfile
+
+          with zipfile.ZipFile("downloaded_app/app.ipa") as ipa:
+              name = next(
+                  n for n in ipa.namelist()
+                  if n.count("/") == 2 and n.endswith(".app/Info.plist")
+              )
+              info = plistlib.loads(ipa.read(name))
+          print("===== Info.plist (UI* and CFBundle* keys) =====")
+          for key in sorted(info):
+              if key.startswith(("UI", "CFBundle")):
+                  print("{} = {!r}".format(key, info[key]))
+          PY
 
       - name: Run the app under touchHLE
         shell: bash

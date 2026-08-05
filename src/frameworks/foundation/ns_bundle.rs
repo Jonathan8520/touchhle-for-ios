@@ -781,7 +781,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)objectForInfoDictionaryKey:(id)key {
     let info_dict: id = msg![env; this infoDictionary];
-    msg![env; info_dict objectForKey:key]
+    let value: id = msg![env; info_dict objectForKey:key];
+    // Apps gate startup work on their own Info.plist: Disney Infinity only
+    // creates its rendering surface if the current orientation is listed in
+    // the entry it reads here. A key that is missing therefore skips an
+    // entire initialisation path with no other trace, so report what was
+    // asked for and whether it was there.
+    let key_name = if key == nil {
+        "nil".to_string()
+    } else {
+        ns_string::to_rust_string(env, key).to_string()
+    };
+    log!(
+        "[NSBundle objectForInfoDictionaryKey:{:?}] -> {}",
+        key_name,
+        if value == nil { "nil" } else { "found" }
+    );
+    value
 }
 
 - (id)localizedInfoDictionary {
