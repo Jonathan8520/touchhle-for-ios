@@ -481,6 +481,7 @@ impl Mem {
     // further occurrences are silently counted. This prevents the log from
     // being flooded when the game repeatedly probes null-page addresses.
     #[cold]
+    #[track_caller]
     fn null_check_fail(at: VAddr, size: GuestUSize, is_write: bool, caller: &str) {
         use std::collections::HashSet;
         use std::sync::Mutex;
@@ -517,14 +518,21 @@ impl Mem {
         } else {
             " — returning stub page"
         };
+        // The whole access chain is `#[track_caller]`, so this names the line
+        // of touchHLE that was handed the null pointer. Without it the report
+        // says only "bytes_at", which is every framework function there is,
+        // and an app that stops here leaves nothing to go on.
+        let blamed = std::panic::Location::caller();
         log!(
             "touchHLE::mem: NULL-PAGE {} at 0x{:08x} (size: 0x{:x}) from {}{} \
-             (unique sites logged: {}/{})",
+             [{}:{}] (unique sites logged: {}/{})",
             op_type,
             at,
             size,
             caller,
             context,
+            blamed.file(),
+            blamed.line(),
             set.len(),
             MAX_UNIQUE_LOGS
         );
@@ -575,6 +583,7 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at] for that).
+    #[track_caller]
     pub fn bytes_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
@@ -640,6 +649,7 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at_mut] for that).
+    #[track_caller]
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
@@ -684,6 +694,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[track_caller]
     pub fn ptr_at<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>, count: GuestUSize) -> *const T
     where
         T: SafeRead,
@@ -720,6 +731,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[track_caller]
     pub fn ptr_at_mut<T>(&mut self, ptr: MutPtr<T>, count: GuestUSize) -> *mut T
     where
         T: SafeRead + SafeWrite,
@@ -754,6 +766,7 @@ impl Mem {
     /// Read a value for memory.
     /// This is the preferred way to read memory in
     /// most cases.
+    #[track_caller]
     pub fn read<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>) -> T
     where
         T: SafeRead,
@@ -766,6 +779,7 @@ impl Mem {
     /// Write a value to memory.
     /// This is the preferred way to write memory in
     /// most cases.
+    #[track_caller]
     pub fn write<T>(&mut self, ptr: MutPtr<T>, value: T)
     where
         T: SafeWrite,
@@ -968,6 +982,7 @@ impl Mem {
     ///
     /// Safety: includes a maximum length guard (64KB) to prevent infinite loops
     /// if the guest provides a pointer to non-terminated data.
+    #[track_caller]
     pub fn cstr_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>) -> &[u8] {
         const MAX_CSTR_LEN: u32 = 65536; // 64KB safety limit
         self.cstr_at_with_max_len(ptr, MAX_CSTR_LEN)
