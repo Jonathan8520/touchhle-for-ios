@@ -840,6 +840,17 @@ pub fn getcwd(env: &mut Environment, buf_ptr: MutPtr<u8>, buf_size: GuestUSize) 
 fn chdir(env: &mut Environment, path_ptr: ConstPtr<u8>) -> i32 {
     set_errno(env, 0);
 
+    // A NULL path is a different failure from an empty one — it means the
+    // caller passed a string it never had, typically `[nil UTF8String]` —
+    // and reading it as a C string would quietly produce "" and hide that.
+    // POSIX gives this EFAULT.
+    if path_ptr.is_null() {
+        use crate::libc::errno::EFAULT;
+        set_errno(env, EFAULT);
+        log!("Warning: chdir(NULL) rejected, returning -1 (EFAULT)");
+        return -1;
+    }
+
     let path_str = env.mem.cstr_at_utf8(path_ptr).unwrap_or_default();
     // POSIX: chdir("") must fail with ENOENT. Treating it as success
     // (which previously silently chdir'd to "/") confuses some apps that
