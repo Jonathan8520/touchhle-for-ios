@@ -579,9 +579,6 @@ def xref(capstone, data, targets):
     within an instruction or two, so a missed site is the exception rather
     than the rule. Each hit is worth confirming with a normal disassembly
     of the address it reports."""
-    arm = capstone.arm
-    md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
-    md.detail = True
     found = {target: [] for target in targets}
     wanted = set(targets)
 
@@ -596,13 +593,40 @@ def xref(capstone, data, targets):
             ),
             file=sys.stderr,
         )
+        sweep_section(capstone, code, section, found, wanted)
+
+    report_xrefs(data, targets, found)
+
+
+def sweep_section(capstone, code, section, found, wanted):
+    """Disassemble one section end to end, restarting where it stalls.
+
+    Capstone stops at the first halfword it cannot decode, and a section
+    this size is full of them — literal pools and jump tables sit inline
+    between functions. Stopping there would sweep the first few hundred
+    bytes and report nothing for the rest. Step over the halfword that
+    blocked it and pick up again; slicing a memoryview costs nothing.
+
+    Register state is dropped at every restart: whatever was skipped was
+    not code, so anything believed about a register before it is no longer
+    worth trusting."""
+    arm = capstone.arm
+    md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
+    md.detail = True
+    view = memoryview(code)
+    base = section["addr"]
+    position = 0
+    restarts = 0
+    while position + 2 <= len(view):
         known, from_slot = {}, {}
         pending = {}
         # A `str rX, [rD]` does not write rD, so without this the register
         # would still hold the address on the next instruction and the same
         # site would be reported again.
         consumed = {}
-        for instruction in md.disasm(code, section["addr"]):
+        decoded_to = position
+        for instruction in md.disasm(view[position:], base + position):
+            decoded_to = instruction.address - base + instruction.size
             # A register that has just become one of the targets was formed
             # by the `add rD,pc` on this line; what happens to it next says
             # whether this site reads the global or writes it.
@@ -639,14 +663,26 @@ def xref(capstone, data, targets):
         for register, (site, value) in pending.items():
             found[value].append((site, "forms", None))
 
+        if decoded_to <= position:
+            position += 2
+        else:
+            position = decoded_to + 2
+            restarts += 1
+    print(
+        "  {} restart(s) over undecodable bytes".format(restarts),
+        file=sys.stderr,
+    )
+
+
+def report_xrefs(data, targets, found):
     for target in targets:
         print()
         print("=== references to {:#x} ===".format(target))
-        hits = found[target]
+        hits = sorted(set(found[target]))
         if not hits:
             print("(none found — the sweep may have missed it, see the docstring)")
             continue
-        for site, action, at in sorted(hits):
+        for site, action, at in hits:
             where = symbol_for(data, site) or symbol_for(data, site | 1)
             print(
                 "{:#010x}  {}{}{}".format(
