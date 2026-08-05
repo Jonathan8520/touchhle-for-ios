@@ -209,8 +209,18 @@ jobs:
             tail -300 run.log
           fi
           echo
-          # Last, so that it is what you see first when reading the log from
-          # the end.
+          # These two go last, so that they are what you see first when
+          # reading the job output from the end.
+          echo "===== what led up to the first null-page access ====="
+          first=$(grep -an 'NULL-PAGE' run.log | head -1 | cut -d: -f1 || true)
+          if [ -n "${first:-}" ]; then
+            start=1
+            if [ "$first" -gt 80 ]; then start=$((first - 80)); fi
+            sed -n "${start},${first}p" run.log
+          else
+            echo "(none)"
+          fi
+          echo
           echo "===== warnings, with addresses and counters folded together ====="
           grep -aE 'Warning|TODO|nimplemented|not implemented|error|Error' run.log \
             | sed -E 's/0x[0-9a-fA-F]+/0xX/g; s/[0-9]+/N/g' \
