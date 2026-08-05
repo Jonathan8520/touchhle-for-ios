@@ -306,13 +306,23 @@ jobs:
           esac
           python3 -m pip install --quiet capstone \
             || python3 -m pip install --quiet --break-system-packages capstone
-          if [ "$CLASSES" = "all" ]; then
-            python3 dev-scripts/disassemble-guest.py --class-list \
-              downloaded_app/app.ipa | tee -a disassembly.txt
-          else
-            # shellcheck disable=SC2046
+          # "all" is a name in the list rather than a mode of its own, so a
+          # single dispatch can both find out what the app is made of and
+          # dump the classes already known to matter.
+          names=$(printf '%s' "$CLASSES" | tr ',' ' ')
+          rest=""
+          for name in $names; do
+            if [ "$name" = "all" ]; then
+              python3 dev-scripts/disassemble-guest.py --class-list \
+                downloaded_app/app.ipa | tee -a disassembly.txt
+            else
+              rest="$rest $name"
+            fi
+          done
+          if [ -n "$rest" ]; then
+            # shellcheck disable=SC2086
             python3 dev-scripts/disassemble-guest.py --class downloaded_app/app.ipa \
-              $(printf '%s' "$CLASSES" | tr ',' ' ') | tee -a disassembly.txt
+              $rest | tee -a disassembly.txt
           fi
 
       - name: Upload the run log
