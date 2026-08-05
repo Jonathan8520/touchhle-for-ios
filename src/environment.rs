@@ -653,13 +653,18 @@ impl Environment {
                             continue;
                         };
 
-                        log_dbg!("Calling static initializers for {:?}", bin.name);
                         assert!(section.size % 4 == 0);
 
                         let base: mem::ConstPtr<abi::GuestFunction> =
                             mem::Ptr::from_bits(section.addr);
 
                         let count = section.size / 4;
+                        // One line per binary. Whether these ran, and how
+                        // many there were, is the first thing worth knowing
+                        // when a global the app was supposed to set is still
+                        // zero — and it was previously only visible in a
+                        // debug build.
+                        log!("Running {} static initializer(s) for {:?}", count, bin.name);
                         for i in 0..count {
                             let func = env.mem.read(base + i);
 
