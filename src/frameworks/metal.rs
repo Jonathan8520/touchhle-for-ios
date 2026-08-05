@@ -231,8 +231,37 @@ const CLASSES: ClassExports = objc_classes! {
 
 };
 
+/// `id<MTLDevice> MTLCreateSystemDefaultDevice(void)`
+///
+/// Returns nil, which is what iOS itself returns on every device that cannot
+/// run Metal — an iPad 2 or an iPhone 5, say, which is the kind of device
+/// these apps were built for. It is also the truth here: this file provides
+/// the object contract Metal code expects during startup, not a Metal
+/// implementation, so an app that gets a device from it goes on to draw
+/// nothing.
+///
+/// This is the question an app asks to decide which renderer to use, and
+/// apps of this era ship an OpenGL ES one for exactly the answer "no". Disney
+/// Infinity 3.0 has a whole second view controller for it: answering "yes"
+/// sent it down a Metal path whose view has no layer, so it never drew a
+/// frame, while the OpenGL renderer it also contains sat unused.
+///
+/// `TOUCHHLE_FAKE_METAL_DEVICE=1` restores the old answer, for an app that
+/// wants a device object for something other than deciding it can render.
 fn MTLCreateSystemDefaultDevice(env: &mut Environment) -> id {
-    msg_class![env; MTLDevice new]
+    if std::env::var_os("TOUCHHLE_FAKE_METAL_DEVICE").is_some() {
+        log_once!(
+            "TOUCHHLE_FAKE_METAL_DEVICE=1: MTLCreateSystemDefaultDevice() is returning a device \
+             object. Nothing drawn through Metal will appear."
+        );
+        return msg_class![env; MTLDevice new];
+    }
+    log_once!(
+        "MTLCreateSystemDefaultDevice() -> nil: touchHLE has no Metal implementation, so it \
+         answers as a device without Metal does. An app that also ships an OpenGL ES renderer \
+         should now use it."
+    );
+    nil
 }
 
 pub const FUNCTIONS: crate::dyld::FunctionExports =
