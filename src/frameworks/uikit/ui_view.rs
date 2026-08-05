@@ -78,6 +78,16 @@ pub struct State {
     pub ui_image_view: ui_image_view::State,
     pub ui_window: ui_window::State,
     pub(super) animation_block: AnimationBlockState,
+    /// Views that need `-layoutSubviews` before the next frame is drawn.
+    ///
+    /// UIKit guarantees a view is laid out before it is first displayed and
+    /// again whenever its size changes, and games put real work there: the
+    /// EAGLView pattern from Apple's own sample code creates the rendering
+    /// surface in `-layoutSubviews`, so a view that is never laid out never
+    /// gets a framebuffer. Kept here rather than as a flag on the host
+    /// object so the run loop can find the dirty views without walking
+    /// every view in the app.
+    pub(super) needing_layout: Vec<id>,
 }
 
 pub(crate) struct UIViewHostObject {
@@ -1142,9 +1152,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setNeedsLayout {
-    // In a real implementation this would mark the view as needing layout
-    // on the next run loop iteration. Since we don't track dirty flags,
-    // this is a no-op — layoutSubviews will be called when appropriate.
+    set_needs_layout(env, this);
 }
 
 // MARK: - Gesture recognizers
@@ -1250,6 +1258,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         this_obj.subviews.push(view);
         let this_layer = this_obj.layer;
         () = msg![env; this_layer addSublayer:subview_layer];
+        // A view that has just entered a hierarchy has never been laid out.
+        set_needs_layout(env, view);
     }
 }
 
@@ -1658,6 +1668,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    // A size change is what UIKit lays a view out for; a move is not.
+    let old_size: CGSize = {
+        let old_frame: CGRect = msg![env; layer frame];
+        old_frame.size
+    };
+    if old_size.width != frame.size.width || old_size.height != frame.size.height {
+        set_needs_layout(env, this);
+    }
     msg![env; layer setFrame:frame]
 }
 - (CGAffineTransform)transform {
@@ -1923,4 +1941,61 @@ fn invoke_bool_block(env: &mut Environment, block: MutPtr<()>, arg: bool) {
     <crate::abi::GuestFunction as CallFromHost<(), (crate::mem::ConstVoidPtr, bool)>>::call_from_host(
         &func, env, (block_arg, arg),
     );
+}
+
+/// Mark a view as needing `-layoutSubviews` before the next frame.
+///
+/// UIKit's contract is that a view is laid out before it is first displayed
+/// and again whenever its size changes. Games rely on it: the EAGLView
+/// pattern from Apple's sample code — which Disney Infinity follows —
+/// creates its rendering surface in `-layoutSubviews`, so a view that never
+/// gets laid out never gets a framebuffer and the app draws nothing.
+pub fn set_needs_layout(env: &mut Environment, view: id) {
+    if view == nil {
+        return;
+    }
+    let dirty = &mut env.framework_state.uikit.ui_view.needing_layout;
+    if !dirty.contains(&view) {
+        dirty.push(view);
+    }
+}
+
+/// How many superviews are above this one, for ordering the layout pass.
+fn view_depth(env: &Environment, view: id) -> u32 {
+    let mut depth = 0;
+    let mut current = view;
+    // A malformed hierarchy must not hang the run loop, so the walk is
+    // bounded rather than trusting the chain to terminate.
+    while depth < 256 {
+        let superview = env.objc.borrow::<UIViewHostObject>(current).superview;
+        if superview == nil {
+            break;
+        }
+        current = superview;
+        depth += 1;
+    }
+    depth
+}
+
+/// Send `-layoutSubviews` to every view that has been marked dirty.
+///
+/// Called once per main run loop iteration, before compositing, which is
+/// where UIKit performs its own layout pass. Superviews are laid out before
+/// their subviews, as on a device, because a superview's layout commonly
+/// resizes the subviews that are about to be laid out themselves.
+pub fn perform_pending_layout(env: &mut Environment) {
+    if env.framework_state.uikit.ui_view.needing_layout.is_empty() {
+        return;
+    }
+    let mut dirty = std::mem::take(&mut env.framework_state.uikit.ui_view.needing_layout);
+    // Retain across the pass: a guest `-layoutSubviews` is free to tear down
+    // other views, and one of them could be later in this list.
+    for &view in &dirty {
+        retain(env, view);
+    }
+    dirty.sort_by_key(|&view| view_depth(env, view));
+    for view in dirty {
+        () = msg![env; view layoutSubviews];
+        release(env, view);
+    }
 }

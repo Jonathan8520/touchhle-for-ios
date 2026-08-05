@@ -393,6 +393,12 @@ pub fn run_run_loop(
             let next_due = uikit::handle_events(env);
             limit_sleep_time(&mut sleep_until, next_due);
 
+            // Before anything is drawn, as UIKit does: a view is laid out
+            // before it is first displayed, and games do real work there
+            // (the EAGLView pattern creates its rendering surface in
+            // `-layoutSubviews`).
+            uikit::ui_view::perform_pending_layout(env);
+
             let next_due = core_animation::recomposite_if_necessary(env, false);
             limit_sleep_time(&mut sleep_until, next_due);
         }

@@ -222,6 +222,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // TODO: post UIWindowDidBecomeVisibleNotification
     () = msg![env; this setHidden:false];
+
+    // A window that has just become visible is about to be displayed, and
+    // UIKit lays out a view before displaying it. Its subviews were already
+    // marked when they were added; this covers the window itself.
+    super::set_needs_layout(env, this);
 }
 
 // Legacy iOS 2/3 pattern: [window setContentView:someView]
