@@ -144,7 +144,12 @@ jobs:
               ;;
           esac
           echo "Downloading $url"
-          curl -fL --retry 4 --retry-delay 2 -o downloaded_app/app.ipa "$url"
+          # An app can be a couple of gigabytes, and a transfer that stalls
+          # part-way through would otherwise hold the job until it times out.
+          # Give up on anything slower than 8 KiB/s for a minute and retry.
+          curl -fL --retry 6 --retry-delay 5 --retry-all-errors \
+            --speed-limit 8192 --speed-time 60 \
+            -o downloaded_app/app.ipa "$url"
           ls -lh downloaded_app/app.ipa
 
       - name: Inspect the app bundle
@@ -194,11 +199,6 @@ jobs:
           lines=$(wc -l < run.log)
           echo "run.log: $lines lines"
           echo
-          echo "===== warnings, with addresses folded together ====="
-          grep -aE 'Warning|TODO|nimplemented|not implemented|error|Error' run.log \
-            | sed -E 's/0x[0-9a-fA-F]+/0xX/g; s/[0-9]+/N/g' \
-            | sort | uniq -c | sort -rn | head -60 || true
-          echo
           if [ "$lines" -le 900 ]; then
             echo "===== full log ====="
             cat run.log
@@ -208,3 +208,10 @@ jobs:
             echo "===== last 300 lines ====="
             tail -300 run.log
           fi
+          echo
+          # Last, so that it is what you see first when reading the log from
+          # the end.
+          echo "===== warnings, with addresses and counters folded together ====="
+          grep -aE 'Warning|TODO|nimplemented|not implemented|error|Error' run.log \
+            | sed -E 's/0x[0-9a-fA-F]+/0xX/g; s/[0-9]+/N/g' \
+            | sort | uniq -c | sort -rn | head -60 || true
