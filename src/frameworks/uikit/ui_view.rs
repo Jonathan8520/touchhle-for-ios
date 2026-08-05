@@ -88,6 +88,9 @@ pub struct State {
     /// object so the run loop can find the dirty views without walking
     /// every view in the app.
     pub(super) needing_layout: Vec<id>,
+    /// How many layouts have been reported, so a per-frame pass does not
+    /// fill the log.
+    pub(super) layouts_logged: u32,
 }
 
 pub(crate) struct UIViewHostObject {
@@ -1995,6 +1998,29 @@ pub fn perform_pending_layout(env: &mut Environment) {
     }
     dirty.sort_by_key(|&view| view_depth(env, view));
     for view in dirty {
+        // What a view is laid out with decides what its `-layoutSubviews`
+        // does — an EAGLView compares its bounds against the surface it
+        // already has — so report the geometry the first few times.
+        let state = &mut env.framework_state.uikit.ui_view;
+        if state.layouts_logged < 16 {
+            state.layouts_logged += 1;
+            let class: Class = msg![env; view class];
+            let name = env.objc.get_class_name(class).to_owned();
+            let bounds: CGRect = msg![env; view bounds];
+            // CGRect is packed, so its fields have to be copied out before
+            // they can be borrowed by the formatter.
+            let (width, height) = (bounds.size.width, bounds.size.height);
+            let (x, y) = (bounds.origin.x, bounds.origin.y);
+            log!(
+                "Laying out {} {:?}: bounds {}x{} at ({}, {})",
+                name,
+                view,
+                width,
+                height,
+                x,
+                y
+            );
+        }
         () = msg![env; view layoutSubviews];
         release(env, view);
     }
