@@ -1925,6 +1925,36 @@ impl Environment {
                     );
                 }
 
+                // A PC this low is not a function the app meant to call: it
+                // is a pointer that was never filled in, or one built from a
+                // base address plus a zero offset. `blx rN` leaves rN alone,
+                // so the register that carried it is still holding it, and
+                // together with the argument registers that is what says
+                // which call this was.
+                const LOWEST_PLAUSIBLE_CODE: u32 = 0x8000;
+                if count == 1 && pc < LOWEST_PLAUSIBLE_CODE {
+                    let regs = *self.cpu.regs();
+                    let carriers: Vec<String> = (0..13)
+                        .filter(|&r| (regs[r] & !1) == pc)
+                        .map(|r| format!("r{}", r))
+                        .collect();
+                    log_no_panic!(
+                        "  ...branched through {} to {:#x}; \
+                         r0={:#x} r1={:#x} r2={:#x} r3={:#x} sp={:#x}",
+                        if carriers.is_empty() {
+                            "an unknown register".to_string()
+                        } else {
+                            carriers.join("/")
+                        },
+                        pc,
+                        regs[0],
+                        regs[1],
+                        regs[2],
+                        regs[3],
+                        regs[cpu::Cpu::SP]
+                    );
+                }
+
                 if count >= BYPASS_LIMIT {
                     panic!(
                         "UndefinedInstruction at {:#x} looped {} times with \

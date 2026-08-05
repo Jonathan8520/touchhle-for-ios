@@ -28,7 +28,26 @@ MH_MAGIC = 0xFEEDFACE
 CPU_TYPE_ARM = 12
 CPU_SUBTYPE_ARM_V7 = 9
 LC_SEGMENT = 0x1
+LC_SYMTAB = 0x2
+LC_DYSYMTAB = 0xB
 VM_PROT_EXECUTE = 0x4
+
+SECTION_TYPE = 0xFF
+S_NON_LAZY_SYMBOL_POINTERS = 0x6
+S_LAZY_SYMBOL_POINTERS = 0x7
+S_SYMBOL_STUBS = 0x8
+POINTER_SECTION_TYPES = (
+    S_NON_LAZY_SYMBOL_POINTERS,
+    S_LAZY_SYMBOL_POINTERS,
+    S_SYMBOL_STUBS,
+)
+
+N_STAB = 0xE0
+N_TYPE = 0x0E
+N_SECT = 0xE
+
+INDIRECT_SYMBOL_LOCAL = 0x80000000
+INDIRECT_SYMBOL_ABS = 0x40000000
 
 WINDOW_BEFORE = 0x40
 WINDOW_AFTER = 0x40
@@ -82,8 +101,8 @@ def armv7_slice(data):
     die("no armv7 slice in this binary")
 
 
-def segments(data):
-    """Yield (vmaddr, vmsize, fileoff, filesize) for every LC_SEGMENT."""
+def load_commands(data):
+    """Yield (cmd, offset, cmdsize) for every load command."""
     magic, _cputype, _cpusubtype, _filetype, ncmds, _sizeofcmds, _flags = struct.unpack_from(
         "<IiiIIII", data, 0
     )
@@ -92,12 +111,168 @@ def segments(data):
     offset = 28
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, offset)
+        if cmdsize == 0:
+            break
+        yield cmd, offset, cmdsize
+        offset += cmdsize
+
+
+def segments(data):
+    """Yield (vmaddr, vmsize, fileoff, filesize, initprot) for every
+    LC_SEGMENT."""
+    for cmd, offset, _cmdsize in load_commands(data):
         if cmd == LC_SEGMENT:
             _name, vmaddr, vmsize, fileoff, filesize, _maxprot, initprot = (
                 struct.unpack_from("<16sIIIIii", data, offset + 8)
             )
             yield vmaddr, vmsize, fileoff, filesize, initprot
-        offset += cmdsize
+
+
+def sections(data):
+    """Yield one dict per section, across every LC_SEGMENT.
+
+    A 32-bit section header is 68 bytes and the headers follow their
+    segment command inline, `nsects` of them."""
+    for cmd, offset, _cmdsize in load_commands(data):
+        if cmd != LC_SEGMENT:
+            continue
+        segname, _vmaddr, _vmsize, _fileoff, _filesize, _maxprot, _initprot, nsects, _fl = (
+            struct.unpack_from("<16sIIIIiiII", data, offset + 8)
+        )
+        at = offset + 56
+        for _ in range(nsects):
+            sectname, _sn, addr, size, _off, _align, _reloff, _nreloc, flags, r1, r2 = (
+                struct.unpack_from("<16s16sIIIIIIIII", data, at)
+            )
+            yield {
+                "segment": segname.rstrip(b"\0").decode("ascii", "replace"),
+                "name": sectname.rstrip(b"\0").decode("ascii", "replace"),
+                "addr": addr,
+                "size": size,
+                "type": flags & SECTION_TYPE,
+                "reserved1": r1,
+                "reserved2": r2,
+            }
+            at += 68
+
+
+# Parsing the symbol tables of a 30 MB binary is not free and every
+# annotated instruction wants them, so they are built once. `data` is kept
+# alive by main() for the whole run, which is what makes id() safe here.
+_TABLES = {}
+
+
+def tables(data):
+    """Address -> symbol name, for defined symbols and for the imported
+    ones reached through a pointer slot or a stub."""
+    cached = _TABLES.get(id(data))
+    if cached is not None:
+        return cached
+
+    defined = {}
+    undefined_names = []
+    indirect = {}
+
+    symoff = nsyms = stroff = strsize = 0
+    indirect_off = nindirect = 0
+    for cmd, offset, _cmdsize in load_commands(data):
+        if cmd == LC_SYMTAB:
+            symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", data, offset + 8)
+        elif cmd == LC_DYSYMTAB:
+            indirect_off, nindirect = struct.unpack_from("<II", data, offset + 56)
+
+    def string_at(index):
+        if index == 0 or stroff + index >= stroff + strsize:
+            return None
+        start = stroff + index
+        end = data.find(b"\0", start, stroff + strsize)
+        if end < 0:
+            return None
+        return data[start:end].decode("ascii", "replace") or None
+
+    # An nlist is {n_strx, n_type, n_sect, n_desc, n_value} = 12 bytes. A
+    # symbol is only an address if it is N_SECT and not a debug entry.
+    all_symbols = []
+    for i in range(nsyms):
+        at = symoff + i * 12
+        if at + 12 > len(data):
+            break
+        n_strx, n_type, _n_sect, _n_desc, n_value = struct.unpack_from("<IBBhI", data, at)
+        name = string_at(n_strx)
+        all_symbols.append(name)
+        if name is None or n_type & N_STAB:
+            continue
+        if (n_type & N_TYPE) == N_SECT and n_value:
+            defined.setdefault(n_value, name)
+
+    # Pointer slots and stubs do not carry their symbol; each is the nth
+    # entry of its section, and `reserved1` says where that section starts
+    # in the indirect symbol table.
+    for section in sections(data):
+        if section["type"] not in POINTER_SECTION_TYPES:
+            continue
+        stride = section["reserved2"] if section["type"] == S_SYMBOL_STUBS else 4
+        if not stride:
+            continue
+        for slot in range(section["size"] // stride):
+            index = section["reserved1"] + slot
+            if index >= nindirect:
+                break
+            (symbol_index,) = struct.unpack_from("<I", data, indirect_off + index * 4)
+            if symbol_index & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS):
+                continue
+            if symbol_index >= len(all_symbols):
+                continue
+            name = all_symbols[symbol_index]
+            if name is None:
+                continue
+            indirect[section["addr"] + slot * stride] = (name, section["name"])
+            undefined_names.append(name)
+
+    built = {"defined": defined, "indirect": indirect}
+    _TABLES[id(data)] = built
+    return built
+
+
+def section_for(data, address):
+    for section in sections(data):
+        if section["addr"] <= address < section["addr"] + section["size"]:
+            return section
+    return None
+
+
+def symbol_for(data, address):
+    """The best name for `address`: an import slot, an exact symbol, or a
+    symbol plus an offset."""
+    built = tables(data)
+    entry = built["indirect"].get(address)
+    if entry is not None:
+        name, section_name = entry
+        return "{} [{}]".format(name, section_name)
+    defined = built["defined"]
+    exact = defined.get(address)
+    if exact is not None:
+        return exact
+    # Thumb function symbols carry the low bit; a call target does too, so
+    # both spellings have to be tried.
+    exact = defined.get(address | 1)
+    if exact is not None:
+        return exact
+    # Falling back to the nearest preceding symbol only makes sense inside
+    # a function. In data it would attach the name of whatever happened to
+    # be defined earlier, which says nothing.
+    if not is_executable(data, address):
+        return None
+    best = None
+    for symbol_address, name in defined.items():
+        base = symbol_address & ~1
+        if base <= address and (best is None or base > best[0]):
+            best = (base, name)
+    if best is None or address - best[0] > 0x2000:
+        return None
+    if address == best[0]:
+        return best[1]
+    return "{}+{:#x}".format(best[1], address - best[0])
 
 
 def file_offset(data, address):
@@ -138,6 +313,10 @@ def describe_pointer(data, address):
     if offset is None or offset + 4 > len(data):
         return None
     (word,) = struct.unpack_from("<I", data, offset)
+    slot = tables(data)["indirect"].get(address)
+    if slot is not None:
+        name, section_name = slot
+        return "{} slot for {} (holds {:#x})".format(section_name, name, word)
     if word == 0:
         return "holds 0 (bound at load time — an external symbol)"
     text = c_string_at(data, word)
@@ -146,6 +325,9 @@ def describe_pointer(data, address):
     name = class_name_at(data, word)
     if name is not None:
         return "holds {:#x} -> class {!r}".format(word, name)
+    name = symbol_for(data, word)
+    if name is not None:
+        return "holds {:#x} -> {}".format(word, name)
     return "holds {:#x}".format(word)
 
 
@@ -173,6 +355,55 @@ def class_name_at(data, address):
     return c_string_at(data, name_ptr, limit=128)
 
 
+def literal_address(capstone, instruction, thumb):
+    """The address a `[pc, #imm]` load reads from, if this is one.
+
+    The PC an instruction sees is two instructions ahead, and in Thumb the
+    result is then rounded down to a word boundary."""
+    for operand in instruction.operands:
+        if operand.type != capstone.arm.ARM_OP_MEM:
+            continue
+        if operand.mem.base != capstone.arm.ARM_REG_PC or operand.mem.index != 0:
+            continue
+        if thumb:
+            return ((instruction.address + 4) & ~3) + operand.mem.disp
+        return instruction.address + 8 + operand.mem.disp
+    return None
+
+
+def annotate(capstone, data, instruction, thumb):
+    """What is worth saying about one instruction, if anything.
+
+    Two things carry the answer to "what did it call": the literal a
+    `ldr rN, [pc, #imm]` loads (which is how a function pointer or an
+    import slot address reaches a register) and the target of a direct
+    branch."""
+    literal = literal_address(capstone, instruction, thumb)
+    if literal is not None:
+        word = read_word(data, literal)
+        if word is None:
+            return "literal at {:#x} is outside the file".format(literal)
+        note = "= [{:#x}] = {:#x}".format(literal, word)
+        name = symbol_for(data, word) or symbol_for(data, word & ~1)
+        if name is not None:
+            return "{} ({})".format(note, name)
+        text = c_string_at(data, word)
+        if text is not None:
+            return "{} ({!r})".format(note, text)
+        described = describe_pointer(data, word)
+        if described is not None and not described.startswith("holds"):
+            return "{} ({})".format(note, described)
+        return note
+
+    if instruction.mnemonic.startswith(("bl", "b.", "b")) and instruction.operands:
+        operand = instruction.operands[0]
+        if operand.type == capstone.arm.ARM_OP_IMM:
+            name = symbol_for(data, operand.imm)
+            if name is not None:
+                return "-> {}".format(name)
+    return None
+
+
 def main(argv):
     if len(argv) < 3:
         sys.exit(__doc__)
@@ -191,13 +422,29 @@ def main(argv):
         start = address - WINDOW_BEFORE
         offset = file_offset(data, start)
         print()
-        print("=== {:#x} ({}) ===".format(address, "Thumb" if thumb else "ARM"))
+        section = section_for(data, address)
+        print(
+            "=== {:#x} ({}{}) ===".format(
+                address,
+                "Thumb" if thumb else "ARM",
+                ", {},{}".format(section["segment"], section["name"]) if section else "",
+            )
+        )
         if offset is None:
             print("not inside any mapped segment")
             continue
-        pointer = describe_pointer(data, address)
-        if pointer is not None:
-            print(pointer)
+        # In code, the useful thing is which function this is inside. In
+        # data it is what the word there holds — printing that for code
+        # would just re-print the instruction as a number.
+        slot = tables(data)["indirect"].get(address)
+        if slot is None and is_executable(data, address):
+            containing = symbol_for(data, address)
+            if containing is not None:
+                print("in {}".format(containing))
+        else:
+            pointer = describe_pointer(data, address)
+            if pointer is not None:
+                print(pointer)
         if not is_executable(data, address):
             # A selector or class reference, not code. Disassembling it would
             # print noise.
@@ -206,13 +453,16 @@ def main(argv):
         code = data[offset : offset + WINDOW_BEFORE + WINDOW_AFTER]
         mode = capstone.CS_MODE_THUMB if thumb else capstone.CS_MODE_ARM
         md = capstone.Cs(capstone.CS_ARCH_ARM, mode)
+        md.detail = True
         for instruction in md.disasm(code, start):
             marker = "  <-- here" if instruction.address == address else ""
+            note = annotate(capstone, data, instruction, thumb)
             print(
-                "{:#010x}  {:<10} {}{}".format(
+                "{:#010x}  {:<10} {:<28}{}{}".format(
                     instruction.address,
                     instruction.mnemonic,
                     instruction.op_str,
+                    "; " + note if note else "",
                     marker,
                 )
             )
