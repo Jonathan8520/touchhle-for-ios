@@ -259,3 +259,11 @@ jobs:
           grep -aE 'Warning|TODO|nimplemented|not implemented|error|Error|missing' run.log \
             | sed -E 's/0x[0-9a-fA-F]+/0xX/g; s/[0-9]+/N/g' \
             | sort | uniq -c | sort -rn | head -60 || true
+          echo
+          # The table above folds addresses together, which is what makes it
+          # readable and also what makes it useless for looking anything up.
+          # These are the addresses themselves, ready for
+          # dev-scripts/disassemble-guest.py.
+          echo "===== guest addresses the emulator named ====="
+          grep -aoE '(called from|return to LR \(|UndefinedInstruction at) ?0x[0-9a-fA-F]+' run.log \
+            | sort -u || true
