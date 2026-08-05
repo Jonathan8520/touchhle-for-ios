@@ -847,7 +847,13 @@ fn chdir(env: &mut Environment, path_ptr: ConstPtr<u8>) -> i32 {
     if path_ptr.is_null() {
         use crate::libc::errno::EFAULT;
         set_errno(env, EFAULT);
-        log!("Warning: chdir(NULL) rejected, returning -1 (EFAULT)");
+        // The return address as well: an app that asks to change to a
+        // directory it does not have is worth looking at in a disassembly,
+        // and dev-scripts/disassemble-guest.py takes exactly this number.
+        log!(
+            "Warning: chdir(NULL) rejected, returning -1 (EFAULT), called from {:#x}",
+            env.cpu.regs()[crate::cpu::Cpu::LR]
+        );
         return -1;
     }
 

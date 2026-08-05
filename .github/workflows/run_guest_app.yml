@@ -187,16 +187,20 @@ jobs:
           esac
           python3 -m pip install --quiet capstone \
             || python3 -m pip install --quiet --break-system-packages capstone
+          # Into a file as well as the log: the job's own output is buried
+          # under the emulator's, and the report job prints this.
           # shellcheck disable=SC2046
           python3 dev-scripts/disassemble-guest.py downloaded_app/app.ipa \
-            $(printf '%s' "$ADDRESSES" | tr ',' ' ')
+            $(printf '%s' "$ADDRESSES" | tr ',' ' ') | tee disassembly.txt
 
       - name: Upload the run log
         if: always()
         uses: actions/upload-artifact@main
         with:
           name: guest_app_run_log
-          path: run.log
+          path: |
+            run.log
+            disassembly.txt
           if-no-files-found: ignore
 
   # An artifact has to be downloaded to be read, which is awkward when all you
@@ -221,6 +225,11 @@ jobs:
       - name: Print the log
         run: |
           set -eu
+          if [ -f disassembly.txt ]; then
+            echo "===== disassembly around the requested addresses ====="
+            cat disassembly.txt
+            echo
+          fi
           lines=$(wc -l < run.log)
           echo "run.log: $lines lines"
           echo
