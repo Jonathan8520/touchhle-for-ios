@@ -44,6 +44,11 @@ on:
         type: string
         required: false
         default: ""
+      disassemble:
+        description: Guest addresses from the log to disassemble, comma-separated hex
+        type: string
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -165,6 +170,26 @@ jobs:
           xvfb-run -a --server-args="-screen 0 640x960x24" \
             ./dev-scripts/ci-run-app.sh ./target/release/touchHLE \
             "${RUN_SECONDS}" downloaded_app/app.ipa ${EXTRA_ARGS}
+
+      # An address in the log — the LR of an ignored UndefinedInstruction, say
+      # — says nothing on its own. This shows the guest instructions around it.
+      - name: Disassemble the guest around the reported addresses
+        if: ${{ always() && inputs.disassemble != '' }}
+        env:
+          ADDRESSES: ${{ inputs.disassemble }}
+        run: |
+          set -eu
+          case "$ADDRESSES" in
+            *[!0-9a-fA-FxX,\ ]*)
+              echo "Addresses must be hexadecimal, separated by commas." >&2
+              exit 2
+              ;;
+          esac
+          python3 -m pip install --quiet capstone \
+            || python3 -m pip install --quiet --break-system-packages capstone
+          # shellcheck disable=SC2046
+          python3 dev-scripts/disassemble-guest.py downloaded_app/app.ipa \
+            $(printf '%s' "$ADDRESSES" | tr ',' ' ')
 
       - name: Upload the run log
         if: always()
