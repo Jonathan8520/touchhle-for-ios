@@ -225,11 +225,6 @@ jobs:
       - name: Print the log
         run: |
           set -eu
-          if [ -f disassembly.txt ]; then
-            echo "===== disassembly around the requested addresses ====="
-            cat disassembly.txt
-            echo
-          fi
           lines=$(wc -l < run.log)
           echo "run.log: $lines lines"
           echo
@@ -267,3 +262,8 @@ jobs:
           echo "===== guest addresses the emulator named ====="
           grep -aoE '(called from|return to LR \(|UndefinedInstruction at) ?0x[0-9a-fA-F]+' run.log \
             | sort -u || true
+          if [ -f disassembly.txt ]; then
+            echo
+            echo "===== disassembly around the requested addresses ====="
+            cat disassembly.txt
+          fi
