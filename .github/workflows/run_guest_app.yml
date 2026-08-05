@@ -13,6 +13,13 @@ name: Run a guest app
 # Only use apps you obtained legally.
 
 on:
+  # GitHub will only let a workflow be dispatched once it has seen a run of
+  # it, and on a branch other than the default one a push is the only way to
+  # get one. Changing this file therefore starts a run that immediately
+  # skips its job, because no app was named.
+  push:
+    paths:
+      - '.github/workflows/run_guest_app.yml'
   workflow_dispatch:
     inputs:
       app_url:
@@ -41,6 +48,7 @@ env:
 jobs:
   run-guest-app:
     name: Run on Linux
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
