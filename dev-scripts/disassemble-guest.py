@@ -614,6 +614,20 @@ def executable_sections(data):
             yield section
 
 
+# Sections holding one pointer per entry that code loads through, rather
+# than naming what they point at. A reference to anything in one of these is
+# a reference to the thing itself.
+INDIRECTION_SECTIONS = (
+    "__objc_classrefs",
+    "__objc_superrefs",
+    "__objc_selrefs",
+    "__objc_protorefs",
+    "__nl_symbol_ptr",
+    "__la_symbol_ptr",
+    "__got",
+)
+
+
 def xref(capstone, data, targets):
     """Report every site that forms one of `targets` as a PC-relative address.
 
@@ -621,7 +635,20 @@ def xref(capstone, data, targets):
     desynchronises on data mixed into the code, but Thumb re-synchronises
     within an instruction or two, so a missed site is the exception rather
     than the rule. Each hit is worth confirming with a normal disassembly
-    of the address it reports."""
+    of the address it reports.
+
+    Code never names an Objective-C class or selector: the compiler puts the
+    pointer in `__objc_classrefs` or `__objc_selrefs` and the code forms the
+    address of *that*. Sweeping for the class itself would truthfully report
+    that nothing reaches it, which is not the answer anyone wants, so the
+    slots holding each target are swept for too."""
+    slot_of = {}
+    for target, stored in data_references(data, targets).items():
+        for _segment, section_name, at in stored:
+            if section_name in INDIRECTION_SECTIONS:
+                slot_of[at] = target
+
+    targets = list(targets) + [slot for slot in slot_of if slot not in targets]
     found = {target: [] for target in targets}
     wanted = set(targets)
 
@@ -638,7 +665,7 @@ def xref(capstone, data, targets):
         )
         sweep_section(capstone, code, section, found, wanted)
 
-    report_xrefs(data, targets, found)
+    report_xrefs(data, targets, found, slot_of)
     report_data_references(data, targets)
 
 
@@ -1138,10 +1165,19 @@ def report_data_references(data, targets):
             print("{:#010x}  in {},{}{}".format(at, segment, name, note))
 
 
-def report_xrefs(data, targets, found):
+def report_xrefs(data, targets, found, slot_of=None):
+    slot_of = slot_of or {}
     for target in targets:
         print()
-        print("=== references to {:#x} ===".format(target))
+        held = slot_of.get(target)
+        if held is not None:
+            print(
+                "=== references to {:#x}, the slot that holds {:#x} ===".format(
+                    target, held
+                )
+            )
+        else:
+            print("=== references to {:#x} ===".format(target))
         hits = sorted(set(found[target]))
         if not hits:
             print("(none found — the sweep may have missed it, see the docstring)")
