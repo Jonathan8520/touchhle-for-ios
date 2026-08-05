@@ -1957,6 +1957,16 @@ pub fn set_needs_layout(env: &mut Environment, view: id) {
     if view == nil {
         return;
     }
+    // Guest code reaches `-setFrame:` and friends with objects that are not
+    // views — an NSMutableSet turned up here — and touchHLE's host-object
+    // borrow fakes its way past a type mismatch rather than refusing, so
+    // such an object would be laid out as though it were a view. Ask the
+    // object what it is instead.
+    let view_class: Class = env.objc.get_known_class("UIView", &mut env.mem);
+    let is_view: bool = msg![env; view isKindOfClass:view_class];
+    if !is_view {
+        return;
+    }
     let dirty = &mut env.framework_state.uikit.ui_view.needing_layout;
     if !dirty.contains(&view) {
         dirty.push(view);
