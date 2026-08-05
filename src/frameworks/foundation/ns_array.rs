@@ -172,7 +172,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (bool)containsObject:(id)object {
     let idx: NSUInteger = msg![env; this indexOfObject:object];
-    idx != NSNotFound as NSUInteger
+    let found = idx != NSNotFound as NSUInteger;
+    // Apps gate startup work on this: Disney Infinity only creates its
+    // rendering surface when the current interface orientation is in the
+    // array it read from its own Info.plist. A false answer there skips
+    // the whole path with no other trace. Report the first few, with the
+    // strings involved, since a mismatch is almost always textual.
+    log_containsobject(env, this, object, found);
+    found
 }
 
 - (id)firstObject {
@@ -1447,4 +1454,43 @@ fn mutable_copy_inner(env: &mut Environment, arr: id) -> id {
     }
     env.objc.borrow_mut::<ArrayHostObject>(mut_arr).array = array;
     mut_arr
+}
+
+/// Report a `-containsObject:` and its answer, for the first few calls.
+///
+/// Capped because an app may search arrays in a loop; the interesting ones
+/// are the handful during startup that decide what gets initialised.
+fn log_containsobject(env: &mut Environment, array: id, object: id, found: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    let describe = |env: &mut Environment, item: id| -> String {
+        if item == nil {
+            return "nil".to_string();
+        }
+        let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+        let is_string: bool = msg![env; item isKindOfClass:string_class];
+        if is_string {
+            format!("{:?}", ns_string::to_rust_string(env, item))
+        } else {
+            let class: Class = msg![env; item class];
+            format!("<{}>", env.objc.get_class_name(class))
+        }
+    };
+    let needle = describe(env, object);
+    let count: NSUInteger = msg![env; array count];
+    let mut items = Vec::new();
+    for i in 0..count.min(8) {
+        let item: id = msg![env; array objectAtIndex:i];
+        items.push(describe(env, item));
+    }
+    log!(
+        "[NSArray containsObject:{}] -> {} (array of {}: [{}])",
+        needle,
+        found,
+        count,
+        items.join(", ")
+    );
 }
