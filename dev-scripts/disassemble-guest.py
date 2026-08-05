@@ -13,6 +13,7 @@ target, and is honoured here.
 Usage:
     dev-scripts/disassemble-guest.py <app.ipa | Foo.app | Mach-O> <address>...
     dev-scripts/disassemble-guest.py --xref <app.ipa | ...> <address>...
+    dev-scripts/disassemble-guest.py --callchain <app.ipa | ...> <address> [depth]
 
 `--xref` answers the other question: not "what is at this address" but
 "what code reaches it". It sweeps every executable section following the
@@ -20,6 +21,12 @@ Usage:
 form a data address, and reports each site that forms one of the given
 addresses, saying whether it goes on to read it or write it. That is how
 you find who is supposed to fill in a global that turned out to be zero.
+
+`--callchain` then walks upwards from a function: who branches to it, who
+branches to them, and so on, so the whole path can be found in one sweep
+instead of one CI round trip per level. Only direct branches count, so a
+function only ever reached through a pointer ends the chain — which is
+itself the answer, since nothing in the binary names it statically.
 
 Addresses are hexadecimal, with or without an 0x prefix. Requires capstone
 (`pip install capstone`).
@@ -618,18 +625,139 @@ def xref(capstone, data, targets):
     report_xrefs(data, targets, found)
 
 
+def iter_code(capstone, data, detail=True):
+    """Every instruction in every executable section, restarting on stalls.
+
+    capstone's disasm ends at the first halfword it cannot decode, and an
+    8 MB __text is full of them: literal pools and jump tables sit inline
+    between functions. Stopping there would cover the start of a section
+    and nothing else. Step over the halfword that blocked it and pick up
+    again; slicing a memoryview is free, so a restart costs nothing.
+
+    Yields `(instruction, restarted)`, where `restarted` marks the first
+    instruction after a stall. A caller tracking register values must
+    throw that state away there: whatever was stepped over was not code,
+    so what a register held before it is not worth trusting."""
+    md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
+    md.detail = detail
+    for section in executable_sections(data):
+        offset = file_offset(data, section["addr"])
+        if offset is None:
+            continue
+        code = data[offset : offset + section["size"]]
+        print(
+            "sweeping {},{} ({} bytes from {:#x})".format(
+                section["segment"], section["name"], len(code), section["addr"]
+            ),
+            file=sys.stderr,
+        )
+        view = memoryview(code)
+        base = section["addr"]
+        position = 0
+        restarts = 0
+        while position + 2 <= len(view):
+            decoded_to = position
+            first = True
+            for instruction in md.disasm(view[position:], base + position):
+                decoded_to = instruction.address - base + instruction.size
+                yield instruction, first
+                first = False
+            if decoded_to <= position:
+                position += 2
+            else:
+                position = decoded_to + 2
+                restarts += 1
+        print(
+            "  {} restart(s) over undecodable bytes".format(restarts),
+            file=sys.stderr,
+        )
+
+
+def build_call_index(capstone, data):
+    """Direct branch targets with their call sites, and every prologue.
+
+    One sweep serves both: walking a call graph upwards needs to know who
+    branches to an address, and which function a branch site is inside."""
+    calls_to = {}
+    prologues = []
+    arm = capstone.arm
+    for instruction, _restarted in iter_code(capstone, data):
+        mnemonic = instruction.mnemonic
+        operands = instruction.operands
+        if mnemonic.startswith("push"):
+            for operand in operands:
+                if operand.type == arm.ARM_OP_REG and operand.reg == arm.ARM_REG_LR:
+                    prologues.append(instruction.address)
+                    break
+        elif mnemonic.startswith("b") and operands:
+            if operands[0].type == arm.ARM_OP_IMM:
+                calls_to.setdefault(operands[0].imm & ~1, []).append(instruction.address)
+    prologues.sort()
+    return calls_to, prologues
+
+
+def containing_function(prologues, address):
+    """The prologue the address most likely belongs to."""
+    import bisect
+
+    index = bisect.bisect_right(prologues, address)
+    return prologues[index - 1] if index else None
+
+
+def callchain(capstone, data, address, depth):
+    """Walk upwards from `address`: who calls it, who calls them.
+
+    Only direct branches are followed, so a function reached through a
+    pointer or a selector ends the chain — which is itself worth knowing,
+    because it means nothing in the binary names it statically."""
+    calls_to, prologues = build_call_index(capstone, data)
+    print(
+        "indexed {} branch targets and {} prologues".format(
+            len(calls_to), len(prologues)
+        ),
+        file=sys.stderr,
+    )
+    seen = set()
+
+    def walk(target, level):
+        indent = "    " * level
+        if target in seen:
+            print("{}{:#x} (already shown)".format(indent, target))
+            return
+        seen.add(target)
+        sites = sorted(set(calls_to.get(target, [])))
+        if not sites:
+            print("{}{:#x}: no direct caller in the binary".format(indent, target))
+            return
+        if level >= depth:
+            print(
+                "{}{:#x}: {} caller(s), depth limit reached".format(
+                    indent, target, len(sites)
+                )
+            )
+            return
+        for site in sites:
+            function = containing_function(prologues, site)
+            name = symbol_for(data, site) or symbol_for(data, site | 1)
+            print(
+                "{}{:#x} <- called at {:#x}{}{}".format(
+                    indent,
+                    target,
+                    site,
+                    " in {:#x}".format(function) if function is not None else "",
+                    "   ({})".format(name) if name else "",
+                )
+            )
+            if function is not None:
+                walk(function, level + 1)
+
+    walk(address & ~1, 0)
+
+
 def sweep_section(capstone, code, section, found, wanted):
     """Disassemble one section end to end, restarting where it stalls.
 
-    Capstone stops at the first halfword it cannot decode, and a section
-    this size is full of them — literal pools and jump tables sit inline
-    between functions. Stopping there would sweep the first few hundred
-    bytes and report nothing for the rest. Step over the halfword that
-    blocked it and pick up again; slicing a memoryview costs nothing.
-
-    Register state is dropped at every restart: whatever was skipped was
-    not code, so anything believed about a register before it is no longer
-    worth trusting."""
+    See [iter_code] for why the restarts are needed."""
     arm = capstone.arm
     md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
     md.detail = True
@@ -728,7 +856,7 @@ def report_xrefs(data, targets, found):
 
 
 def main(argv):
-    if argv[1:2] == ["--xref"]:
+    if argv[1:2] in (["--xref"], ["--callchain"]):
         if len(argv) < 4:
             sys.exit(__doc__)
         try:
@@ -736,7 +864,11 @@ def main(argv):
         except ImportError:
             die("capstone is not installed (pip install capstone)")
         data = armv7_slice(find_executable(argv[2]))
-        xref(capstone, data, [int(raw, 16) & ~1 for raw in argv[3:]])
+        if argv[1] == "--xref":
+            xref(capstone, data, [int(raw, 16) & ~1 for raw in argv[3:]])
+        else:
+            depth = int(argv[4]) if len(argv) > 4 else 8
+            callchain(capstone, data, int(argv[3], 16), depth)
         return
 
     if len(argv) < 3:
