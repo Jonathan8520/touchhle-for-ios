@@ -200,21 +200,25 @@ pub(super) fn gesture_recognizers(env: &Environment, view: id) -> Vec<id> {
 fn init_common(env: &mut Environment, this: id) -> id {
     let view_class: Class = msg![env; this class];
     let layer_class: Class = msg![env; view_class layerClass];
-    let layer: id = msg![env; layer_class layer];
     // A view whose layer is nil draws nothing and answers every question
-    // about its layer with zero, which looks like a view that simply has
-    // nothing to show. This happens when `+layerClass` names a class touchHLE
-    // does not implement — `+[CAMetalLayer class]` is nil here, for one — so
-    // say which class was asked for.
-    if layer == nil {
+    // about its layer with zero, which is indistinguishable from a view that
+    // simply has nothing to show. UIKit never produces one: `+layerClass`
+    // names a real class or the app does not run. It happens here when
+    // `+layerClass` names a class touchHLE does not implement, and a plain
+    // CALayer at least leaves the view able to answer for its geometry.
+    let layer: id = if layer_class == nil {
         log!(
-            "Warning: +[{} layerClass] gave {:?}, so {:?} has no layer and will \
-             never draw. touchHLE probably does not implement that layer class.",
+            "Warning: +[{} layerClass] gave nil, so {:?} is being given a plain \
+             CALayer. touchHLE does not implement whichever layer class it asked \
+             for, and anything the app draws through that layer will be missing.",
             env.objc.get_class_name(view_class),
-            layer_class,
             this,
         );
-    }
+        let fallback: Class = env.objc.get_known_class("CALayer", &mut env.mem);
+        msg![env; fallback layer]
+    } else {
+        msg![env; layer_class layer]
+    };
     () = msg![env; layer setDelegate:this];
     () = msg![env; layer setOpaque:true];
     crate::frameworks::core_animation::ca_layer::set_use_implicit_animations(env, layer, false);

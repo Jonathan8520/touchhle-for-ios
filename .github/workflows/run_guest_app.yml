@@ -209,9 +209,17 @@ jobs:
                   if n.count("/") == 2 and n.endswith(".app/Info.plist")
               )
               info = plistlib.loads(ipa.read(name))
-          print("===== Info.plist (UI* and CFBundle* keys) =====")
+          # DT* and MinimumOSVersion say which SDK the app was built
+          # against, which decides UIKit behaviour it depends on — screen
+          # bounds became interface-oriented for apps linked against iOS 8,
+          # for one — so they belong here next to what the app asks for.
+          print("===== Info.plist (UI*, CFBundle*, DT* and version keys) =====")
           for key in sorted(info):
-              if key.startswith(("UI", "CFBundle")):
+              if key.startswith(("UI", "CFBundle", "DT")) or key in (
+                  "MinimumOSVersion",
+                  "LSRequiresIPhoneOS",
+                  "LSApplicationCategoryType",
+              ):
                   print("{} = {!r}".format(key, info[key]))
           PY
 

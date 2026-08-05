@@ -1190,6 +1190,22 @@ pub fn objc_getClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class 
         Err(_) => return nil,
     };
     if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
+        // A class touchHLE does not implement still has a placeholder here,
+        // because binding the app's class reference had to produce something.
+        // That placeholder answers every message with zero, so it is no use
+        // to anyone — but looking a class up by name is how an app asks
+        // whether a system feature exists at all, and a placeholder makes
+        // that question come back "yes". The app then takes a path it cannot
+        // finish instead of the fallback it shipped for exactly this case.
+        //
+        // Disney Infinity 3.0 asks for CAMetalLayer this way. Answering "yes"
+        // makes `+[MetalView layerClass]` name a layer class that does not
+        // exist, so its view has no layer, and the OpenGL renderer it was
+        // going to fall back to never gets a surface to draw into.
+        if env.objc.is_unimplemented_class(class) {
+            report_class_reported_missing(&name_str);
+            return nil;
+        }
         return class;
     }
 
@@ -1198,6 +1214,23 @@ pub fn objc_getClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class 
     }
 
     nil
+}
+
+/// Log the first time each class name is answered with nil, so the decision
+/// is visible without one line per probe (apps poll these in a loop).
+fn report_class_reported_missing(name: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static REPORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let reported = REPORTED.get_or_init(|| Mutex::new(HashSet::new()));
+    if reported.lock().unwrap().insert(name.to_string()) {
+        log!(
+            "Looking up the class \"{}\" by name: reporting it as absent, because \
+             touchHLE only has a placeholder for it. An app checking this way is \
+             asking whether the feature exists, and should now take its fallback.",
+            name,
+        );
+    }
 }
 
 pub fn objc_begin_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
