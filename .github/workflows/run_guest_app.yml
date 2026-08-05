@@ -59,6 +59,11 @@ on:
         type: string
         required: false
         default: ""
+      dump_classes:
+        description: Objective-C class names (or parts of them) to dump, comma-separated; "all" lists every class
+        type: string
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -283,6 +288,32 @@ jobs:
             || python3 -m pip install --quiet --break-system-packages capstone
           python3 dev-scripts/disassemble-guest.py --callchain downloaded_app/app.ipa \
             "$ADDRESS" | tee -a disassembly.txt
+
+      # An app's own classes are the part of it the emulator's log names but
+      # cannot explain. This turns a selector from an --trace-objc run into
+      # the address of the method that implements it.
+      - name: Dump the app's Objective-C classes
+        if: ${{ always() && inputs.dump_classes != '' }}
+        env:
+          CLASSES: ${{ inputs.dump_classes }}
+        run: |
+          set -euo pipefail
+          case "$CLASSES" in
+            *[!0-9a-zA-Z_,\ ]*)
+              echo "Class names must be alphanumeric, separated by commas." >&2
+              exit 2
+              ;;
+          esac
+          python3 -m pip install --quiet capstone \
+            || python3 -m pip install --quiet --break-system-packages capstone
+          if [ "$CLASSES" = "all" ]; then
+            python3 dev-scripts/disassemble-guest.py --class-list \
+              downloaded_app/app.ipa | tee -a disassembly.txt
+          else
+            # shellcheck disable=SC2046
+            python3 dev-scripts/disassemble-guest.py --class downloaded_app/app.ipa \
+              $(printf '%s' "$CLASSES" | tr ',' ' ') | tee -a disassembly.txt
+          fi
 
       - name: Upload the run log
         if: always()

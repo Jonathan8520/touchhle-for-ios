@@ -15,13 +15,15 @@ Usage:
     dev-scripts/disassemble-guest.py --xref <app.ipa | ...> <address>...
     dev-scripts/disassemble-guest.py --callchain <app.ipa | ...> <address> [depth]
     dev-scripts/disassemble-guest.py --class <app.ipa | ...> <name>...
+    dev-scripts/disassemble-guest.py --class-list <app.ipa | ...>
 
 `--class` goes the other way round from an address: given part of a class
 name, it prints that class's methods with the address of each one, plus its
 ivars and their offsets. touchHLE's `--trace-objc` names the selectors an app
 sends; this turns them into addresses to disassemble, and shows the methods
 the app has that it did *not* send, which is usually the more interesting
-half.
+half. `--class-list` names every class the app defines, one line each, for
+when you do not yet know what to ask for.
 
 `--xref` answers the other question: not "what is at this address" but
 "what code reaches it". It sweeps every executable section following the
@@ -1045,6 +1047,41 @@ def report_class(data, address):
             )
 
 
+def report_class_list(data):
+    """One line per class the app defines, to find out what it is made of."""
+    rows = []
+    for class_pointer in pointer_list(data, "__objc_classlist"):
+        name = class_name_at(data, class_pointer)
+        class_ro = read_word(data, class_pointer + 0x10)
+        metaclass = read_word(data, class_pointer)
+        metaclass_ro = read_word(data, metaclass + 0x10) if metaclass else None
+        superclass = read_word(data, class_pointer + 4)
+        rows.append(
+            (
+                name or "?",
+                class_pointer,
+                class_name_at(data, superclass) if superclass else None,
+                len(list(method_list(data, read_word(data, metaclass_ro + 0x14))))
+                if metaclass_ro
+                else 0,
+                len(list(method_list(data, read_word(data, class_ro + 0x14))))
+                if class_ro
+                else 0,
+            )
+        )
+    print("{} classes defined by this app:".format(len(rows)))
+    for name, address, superclass_name, class_methods, instance_methods in sorted(rows):
+        print(
+            "{:#010x}  {: <44} : {: <28} {} class + {} instance methods".format(
+                address,
+                name,
+                superclass_name or "(bound at load time)",
+                class_methods,
+                instance_methods,
+            )
+        )
+
+
 def report_classes(data, wanted):
     """Print every class and category whose name contains one of `wanted`."""
     needles = [needle.lower() for needle in wanted]
@@ -1125,6 +1162,12 @@ def report_xrefs(data, targets, found):
 
 
 def main(argv):
+    if argv[1:2] == ["--class-list"]:
+        if len(argv) != 3:
+            sys.exit(__doc__)
+        report_class_list(armv7_slice(find_executable(argv[2])))
+        return
+
     if argv[1:2] == ["--class"]:
         if len(argv) < 4:
             sys.exit(__doc__)
