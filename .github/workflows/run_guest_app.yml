@@ -165,7 +165,9 @@ jobs:
               echo "Resolving archive.org item $identifier"
               curl -fL --retry 4 --retry-delay 2 \
                 -o metadata.json "https://archive.org/metadata/$identifier"
-              url=$(python3 -c 'import json, sys, urllib.parse; files = json.load(open("metadata.json")).get("files", []); names = [f["name"] for f in files if f.get("name", "").lower().endswith(".ipa")]; sys.exit("No .ipa in the item file list") if not names else None; print("https://archive.org/download/" + sys.argv[1] + "/" + urllib.parse.quote(names[0]))' "$identifier")
+              # An item that does not exist is not an error to the metadata
+              # API, it is an empty object. Say which of the two happened.
+              url=$(python3 -c 'import json, sys, urllib.parse; meta = json.load(open("metadata.json")); sys.exit("archive.org has no item named " + sys.argv[1]) if not meta else None; names = [f["name"] for f in meta.get("files", []) if f.get("name", "").lower().endswith(".ipa")]; sys.exit("No .ipa among the files of " + sys.argv[1]) if not names else None; print("https://archive.org/download/" + sys.argv[1] + "/" + urllib.parse.quote(names[0]))' "$identifier")
               ;;
           esac
           echo "Downloading $url"
@@ -198,7 +200,9 @@ jobs:
         env:
           ADDRESSES: ${{ inputs.disassemble }}
         run: |
-          set -eu
+          # Without pipefail the `| tee` below would swallow a failure of
+          # the script and report the step as having succeeded.
+          set -euo pipefail
           case "$ADDRESSES" in
             *[!0-9a-fA-FxX,\ ]*)
               echo "Addresses must be hexadecimal, separated by commas." >&2
@@ -245,6 +249,12 @@ jobs:
       - name: Print the log
         run: |
           set -eu
+          # A run that fell over before starting the emulator has no
+          # run.log, and the disassembly is then the only thing there is to
+          # show. Reporting nothing at all because of that would hide it.
+          if [ ! -f run.log ]; then
+            echo "No run.log in the artifact: the run never reached the emulator."
+          else
           lines=$(wc -l < run.log)
           echo "run.log: $lines lines"
           echo
@@ -282,6 +292,7 @@ jobs:
           echo "===== guest addresses the emulator named ====="
           grep -aoE '(called from|return to LR \(|UndefinedInstruction at) ?0x[0-9a-fA-F]+' run.log \
             | sort -u || true
+          fi
           if [ -f disassembly.txt ]; then
             echo
             echo "===== disassembly around the requested addresses ====="
