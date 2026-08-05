@@ -1046,10 +1046,14 @@ fn path_for_resource_helper(
     let data_path: id = msg![env; path stringByAppendingPathComponent:data_component];
     let data_path: id = msg![env; data_path stringByAppendingPathComponent:name];
     let data_path_exists: bool = msg![env; file_manager fileExistsAtPath:data_path];
+    // The paths, not the pointers to them: a resource an app cannot find is
+    // worth knowing the name of, and a guest address says nothing.
+    let path_str = ns_string::to_rust_string(env, path).into_owned();
+    let data_path_str = ns_string::to_rust_string(env, data_path).into_owned();
     log!(
         "NSBundle resource lookup: {:?} missing, Unity Data fallback {:?} exists={}",
-        path,
-        data_path,
+        path_str,
+        data_path_str,
         data_path_exists
     );
     if data_path_exists {
@@ -1057,8 +1061,7 @@ fn path_for_resource_helper(
     }
 
     // Case-insensitive fallback: scan the parent directory.
-    let path_str = ns_string::to_rust_string(env, path);
-    let rust_path = std::path::Path::new(path_str.as_ref());
+    let rust_path = std::path::Path::new(path_str.as_str());
     if let (Some(parent), Some(file_name)) = (rust_path.parent(), rust_path.file_name()) {
         let parent_str = parent.to_str().unwrap_or("");
         let target_name = file_name.to_str().unwrap_or("").to_lowercase();

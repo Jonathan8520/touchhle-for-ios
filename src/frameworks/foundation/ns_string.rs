@@ -521,7 +521,19 @@ pub fn with_format(env: &mut Environment, format: id, args: VaList) -> String {
         },
         args,
     );
-    String::from_utf8_lossy(&res).into_owned()
+    let res = String::from_utf8_lossy(&res).into_owned();
+    // A "(null)" in the result is a nil where the app expected an object, and
+    // is usually the first visible sign of something upstream having handed
+    // back nothing. Only this case is reported: a formatted string can carry
+    // identifiers and other things that have no business in a log file.
+    if res.contains("(null)") {
+        log!(
+            "Warning: {:?} was formatted with a nil argument, giving {:?}",
+            format_string,
+            res
+        );
+    }
+    res
 }
 
 pub fn from_rust_ordering(ordering: std::cmp::Ordering) -> NSComparisonResult {
