@@ -1278,70 +1278,37 @@ pub fn object_getClass(env: &mut crate::Environment, obj: id) -> Class {
     objc_obj.isa
 }
 
-pub fn objc_retainAutoreleasedReturnValue(
-    env: &mut crate::Environment,
-    name: ConstPtr<u8>,
-) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+/// `id objc_autoreleaseReturnValue(id value)` — the callee's half of ARC's
+/// return sequence, emitted where a method hands back an object it does not
+/// want to keep owning.
+///
+/// Apple's runtime may pass the object to the caller through thread-local
+/// storage so that the matching `objc_retainAutoreleasedReturnValue` can skip
+/// both the autorelease and the retain. That is an optimisation of a
+/// behaviour that is always correct on its own — autorelease here, retain in
+/// the caller — and it is that behaviour touchHLE implements. See
+/// `objc4` `NSObject.mm`.
+///
+/// These three functions used to be written as if their argument were a
+/// class name: they read a C string from the object pointer, looked a class
+/// up by that name and returned nil when there wasn't one, which there never
+/// is. Every `x = [Foo bar];` in an ARC-compiled app therefore came out nil.
+pub fn objc_autoreleaseReturnValue(env: &mut crate::Environment, value: id) -> id {
+    crate::objc::autorelease(env, value)
 }
 
-pub fn objc_autoreleaseReturnValue(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+/// `id objc_retainAutoreleasedReturnValue(id value)` — the caller's half of
+/// the sequence above, taking ownership of what the callee returned.
+pub fn objc_retainAutoreleasedReturnValue(env: &mut crate::Environment, value: id) -> id {
+    objc_retain(env, value)
 }
 
-pub fn objc_retainAutoreleaseReturnValue(
-    env: &mut crate::Environment,
-    name: ConstPtr<u8>,
-) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+/// `id objc_retainAutoreleaseReturnValue(id value)` — a retain followed by
+/// the same return sequence as [objc_autoreleaseReturnValue], emitted when a
+/// method returns an object it also keeps a reference to.
+pub fn objc_retainAutoreleaseReturnValue(env: &mut crate::Environment, value: id) -> id {
+    let value = objc_retain(env, value);
+    objc_autoreleaseReturnValue(env, value)
 }
 
 pub fn objc_autoreleasePoolPush(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
