@@ -886,6 +886,13 @@ def objc_method_at(data, address):
         return None
     text = c_string_at(data, value, limit=256)
     if text is not None:
+        # The name is the first of the three words, so when this is one the
+        # IMP is two along — which is the address worth disassembling.
+        imp = read_word(data, address + 8)
+        if imp and is_executable(data, imp & ~1):
+            return "the name of a method_t; its IMP is {:#x} (pass {:#x})".format(
+                imp & ~1, imp | 1
+            )
         return "a method_t field holding {!r}".format(text)
 
     name_pointer = read_word(data, address - 8)
