@@ -419,6 +419,12 @@ def describe_slot(data, slot):
         return " (holds {:#x} = {}{})".format(word, name, where)
     if word == 0:
         return " (holds 0 in the file: filled in at load time{})".format(where)
+    # An __objc_selrefs slot holds a pointer to the selector's name, which
+    # is the whole point of reading it: `ldr r1, [selref]; blx objc_msgSend`
+    # is a message send, and the string says which one.
+    text = c_string_at(data, word)
+    if text is not None:
+        return " (holds {:#x} -> {!r}{})".format(word, text, where)
     return " (holds {:#x}{})".format(word, where)
 
 
