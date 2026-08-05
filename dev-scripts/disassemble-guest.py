@@ -49,7 +49,7 @@ N_SECT = 0xE
 INDIRECT_SYMBOL_LOCAL = 0x80000000
 INDIRECT_SYMBOL_ABS = 0x40000000
 
-WINDOW_BEFORE = 0x40
+WINDOW_BEFORE = 0xC0
 WINDOW_AFTER = 0x40
 
 
@@ -355,6 +355,25 @@ def class_name_at(data, address):
     return c_string_at(data, name_ptr, limit=128)
 
 
+def describe_slot(data, slot):
+    """A parenthesised note about what lives at `slot`, or nothing."""
+    section = section_for(data, slot)
+    entry = tables(data)["indirect"].get(slot)
+    if entry is not None:
+        name, section_name = entry
+        return " ({}, {})".format(name, section_name)
+    word = read_word(data, slot)
+    if word is None:
+        return " (outside the file)"
+    where = ", in {},{}".format(section["segment"], section["name"]) if section else ""
+    name = symbol_for(data, word) or symbol_for(data, word & ~1)
+    if name is not None:
+        return " (holds {:#x} = {}{})".format(word, name, where)
+    if word == 0:
+        return " (holds 0 in the file: filled in at load time{})".format(where)
+    return " (holds {:#x}{})".format(word, where)
+
+
 def literal_address(capstone, instruction, thumb):
     """The address a `[pc, #imm]` load reads from, if this is one.
 
@@ -371,13 +390,88 @@ def literal_address(capstone, instruction, thumb):
     return None
 
 
-def annotate(capstone, data, instruction, thumb):
+def track(capstone, instruction, thumb, known, from_slot):
+    """Follow the three instructions that build a PC-relative address.
+
+    Position-independent Thumb-2 code reaches a data slot as
+    `movw rD,#lo; movt rD,#hi; add rD,pc`, and only loads through it
+    afterwards. `known` maps a register to the constant it holds and
+    `from_slot` remembers which slot a loaded value came from, which is
+    what lets a later `blx rD` say what it is calling.
+
+    Anything else that writes a register clears what was known about it,
+    so a stale value is never carried forward onto an unrelated use."""
+    arm = capstone.arm
+    operands = instruction.operands
+    mnemonic = instruction.mnemonic
+
+    def is_reg(operand, register):
+        return operand.type == arm.ARM_OP_REG and operand.reg == register
+
+    handled = False
+    if mnemonic == "movw" and len(operands) == 2 and operands[1].type == arm.ARM_OP_IMM:
+        known[operands[0].reg] = operands[1].imm & 0xFFFF
+        handled = True
+    elif mnemonic == "movt" and len(operands) == 2 and operands[1].type == arm.ARM_OP_IMM:
+        low = known.get(operands[0].reg, 0) & 0xFFFF
+        known[operands[0].reg] = low | ((operands[1].imm & 0xFFFF) << 16)
+        handled = True
+    elif mnemonic == "add" and len(operands) == 2 and is_reg(operands[1], arm.ARM_REG_PC):
+        base = known.get(operands[0].reg)
+        if base is not None:
+            # The PC an instruction sees is two instructions ahead.
+            pc = instruction.address + (4 if thumb else 8)
+            known[operands[0].reg] = (base + pc) & 0xFFFFFFFF
+            handled = True
+    elif (
+        mnemonic.startswith("ldr")
+        and len(operands) == 2
+        and operands[1].type == arm.ARM_OP_MEM
+        and operands[1].mem.index == 0
+        and operands[1].mem.disp == 0
+    ):
+        slot = known.get(operands[1].mem.base)
+        if slot is not None:
+            from_slot[operands[0].reg] = slot
+            known.pop(operands[0].reg, None)
+            handled = True
+
+    if not handled:
+        _read, written = instruction.regs_access()
+        for register in written:
+            known.pop(register, None)
+            from_slot.pop(register, None)
+
+
+def annotate(capstone, data, instruction, thumb, known, from_slot):
     """What is worth saying about one instruction, if anything.
 
-    Two things carry the answer to "what did it call": the literal a
-    `ldr rN, [pc, #imm]` loads (which is how a function pointer or an
-    import slot address reaches a register) and the target of a direct
-    branch."""
+    Three things carry the answer to "what did it call": the literal a
+    `ldr rN, [pc, #imm]` loads, the slot a tracked `ldr rN, [rM]` reads,
+    and the target of a direct branch."""
+    arm = capstone.arm
+    operands = instruction.operands
+
+    # `blx rN` / `bx rN` where rN was loaded from a slot we followed.
+    if instruction.mnemonic in ("blx", "bx") and operands:
+        if operands[0].type == arm.ARM_OP_REG:
+            slot = from_slot.get(operands[0].reg)
+            if slot is not None:
+                return "calls through the pointer at {:#x}{}".format(
+                    slot, describe_slot(data, slot)
+                )
+
+    if (
+        instruction.mnemonic.startswith("ldr")
+        and len(operands) == 2
+        and operands[1].type == arm.ARM_OP_MEM
+        and operands[1].mem.index == 0
+        and operands[1].mem.disp == 0
+        and known.get(operands[1].mem.base) is not None
+    ):
+        slot = known[operands[1].mem.base]
+        return "reads {:#x}{}".format(slot, describe_slot(data, slot))
+
     literal = literal_address(capstone, instruction, thumb)
     if literal is not None:
         word = read_word(data, literal)
@@ -404,6 +498,30 @@ def annotate(capstone, data, instruction, thumb):
     return None
 
 
+def disassemble_window(md, data, address, thumb):
+    """Instructions around `address`, decoded from a start that lands on it.
+
+    There is no way to know where the instruction before a given one
+    begins, so the window has to start at a guess. A guess that is wrong
+    decodes into something that never contains `address` at all, and the
+    movw/movt pair the annotation depends on would be misread. Try each
+    start in turn and keep the earliest one that does land on `address`,
+    since that is the one with the most context before it."""
+    fallback = None
+    for back in range(WINDOW_BEFORE, -1, -2):
+        start = address - back
+        offset = file_offset(data, start)
+        if offset is None:
+            continue
+        code = data[offset : offset + back + WINDOW_AFTER]
+        instructions = list(md.disasm(code, start))
+        if any(instruction.address == address for instruction in instructions):
+            return instructions
+        if fallback is None:
+            fallback = instructions
+    return fallback or []
+
+
 def main(argv):
     if len(argv) < 3:
         sys.exit(__doc__)
@@ -419,8 +537,6 @@ def main(argv):
         address = int(raw, 16)
         thumb = bool(address & 1)
         address &= ~1
-        start = address - WINDOW_BEFORE
-        offset = file_offset(data, start)
         print()
         section = section_for(data, address)
         print(
@@ -430,7 +546,7 @@ def main(argv):
                 ", {},{}".format(section["segment"], section["name"]) if section else "",
             )
         )
-        if offset is None:
+        if file_offset(data, address) is None:
             print("not inside any mapped segment")
             continue
         # In code, the useful thing is which function this is inside. In
@@ -450,13 +566,18 @@ def main(argv):
             # print noise.
             print("(not in an executable segment; not disassembling)")
             continue
-        code = data[offset : offset + WINDOW_BEFORE + WINDOW_AFTER]
         mode = capstone.CS_MODE_THUMB if thumb else capstone.CS_MODE_ARM
         md = capstone.Cs(capstone.CS_ARCH_ARM, mode)
         md.detail = True
-        for instruction in md.disasm(code, start):
+        instructions = disassemble_window(md, data, address, thumb)
+        if not instructions:
+            print("(nothing decodable around this address)")
+            continue
+        known, from_slot = {}, {}
+        for instruction in instructions:
+            note = annotate(capstone, data, instruction, thumb, known, from_slot)
+            track(capstone, instruction, thumb, known, from_slot)
             marker = "  <-- here" if instruction.address == address else ""
-            note = annotate(capstone, data, instruction, thumb)
             print(
                 "{:#010x}  {:<10} {:<28}{}{}".format(
                     instruction.address,

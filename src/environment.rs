@@ -1925,34 +1925,39 @@ impl Environment {
                     );
                 }
 
-                // A PC this low is not a function the app meant to call: it
-                // is a pointer that was never filled in, or one built from a
-                // base address plus a zero offset. `blx rN` leaves rN alone,
-                // so the register that carried it is still holding it, and
-                // together with the argument registers that is what says
-                // which call this was.
+                // A PC this low is not a function the app meant to call. The
+                // registers still hold what they held at the call, so
+                // together with a disassembly of LR they say which call it
+                // was: `blx rN` leaves rN alone, and the register that
+                // computed the address of the pointer often survives too.
                 const LOWEST_PLAUSIBLE_CODE: u32 = 0x8000;
                 if count == 1 && pc < LOWEST_PLAUSIBLE_CODE {
                     let regs = *self.cpu.regs();
-                    let carriers: Vec<String> = (0..13)
-                        .filter(|&r| (regs[r] & !1) == pc)
-                        .map(|r| format!("r{}", r))
-                        .collect();
+                    let mut dump = String::new();
+                    for (r, value) in regs.iter().enumerate().take(13) {
+                        dump.push_str(&format!("r{}={:#x} ", r, value));
+                    }
                     log_no_panic!(
-                        "  ...branched through {} to {:#x}; \
-                         r0={:#x} r1={:#x} r2={:#x} r3={:#x} sp={:#x}",
-                        if carriers.is_empty() {
-                            "an unknown register".to_string()
-                        } else {
-                            carriers.join("/")
-                        },
-                        pc,
-                        regs[0],
-                        regs[1],
-                        regs[2],
-                        regs[3],
+                        "  ...registers at the trap: {}sp={:#x}",
+                        dump,
                         regs[cpu::Cpu::SP]
                     );
+                    // Branching to a null pointer does not fault at 0. The
+                    // null page reads as zeroes, and a zero word decodes as
+                    // a valid ARM instruction, so execution slides through
+                    // the page and only trips over the first thing that is
+                    // not one — the Mach-O header at the start of __TEXT.
+                    // The tell is that no register holds the address that
+                    // finally trapped.
+                    if !regs.iter().take(13).any(|&value| (value & !1) == pc) {
+                        log_no_panic!(
+                            "  ...no register holds {:#x}, so this is most \
+                             likely a call through a null function pointer \
+                             that ran through the null page to get here; \
+                             look for a register holding 0.",
+                            pc
+                        );
+                    }
                 }
 
                 if count >= BYPASS_LIMIT {
