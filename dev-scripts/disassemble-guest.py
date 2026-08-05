@@ -12,6 +12,14 @@ target, and is honoured here.
 
 Usage:
     dev-scripts/disassemble-guest.py <app.ipa | Foo.app | Mach-O> <address>...
+    dev-scripts/disassemble-guest.py --xref <app.ipa | ...> <address>...
+
+`--xref` answers the other question: not "what is at this address" but
+"what code reaches it". It sweeps every executable section following the
+`movw`/`movt`/`add rD,pc` triples that position-independent code uses to
+form a data address, and reports each site that forms one of the given
+addresses, saying whether it goes on to read it or write it. That is how
+you find who is supposed to fill in a global that turned out to be zero.
 
 Addresses are hexadecimal, with or without an 0x prefix. Requires capstone
 (`pip install capstone`).
@@ -555,7 +563,113 @@ def disassemble_window(md, data, address, thumb):
     return fallback or []
 
 
+def executable_sections(data):
+    for section in sections(data):
+        if section["type"] in ZEROFILL_SECTION_TYPES or not section["size"]:
+            continue
+        if is_executable(data, section["addr"]):
+            yield section
+
+
+def xref(capstone, data, targets):
+    """Report every site that forms one of `targets` as a PC-relative address.
+
+    A linear sweep, because there is no map of where the functions are. It
+    desynchronises on data mixed into the code, but Thumb re-synchronises
+    within an instruction or two, so a missed site is the exception rather
+    than the rule. Each hit is worth confirming with a normal disassembly
+    of the address it reports."""
+    arm = capstone.arm
+    md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
+    md.detail = True
+    found = {target: [] for target in targets}
+    wanted = set(targets)
+
+    for section in executable_sections(data):
+        offset = file_offset(data, section["addr"])
+        if offset is None:
+            continue
+        code = data[offset : offset + section["size"]]
+        print(
+            "sweeping {},{} ({} bytes from {:#x})".format(
+                section["segment"], section["name"], len(code), section["addr"]
+            ),
+            file=sys.stderr,
+        )
+        known, from_slot = {}, {}
+        pending = {}
+        # A `str rX, [rD]` does not write rD, so without this the register
+        # would still hold the address on the next instruction and the same
+        # site would be reported again.
+        consumed = {}
+        for instruction in md.disasm(code, section["addr"]):
+            # A register that has just become one of the targets was formed
+            # by the `add rD,pc` on this line; what happens to it next says
+            # whether this site reads the global or writes it.
+            operands = instruction.operands
+            if pending:
+                for register, (site, value) in list(pending.items()):
+                    action = None
+                    if (
+                        len(operands) == 2
+                        and operands[1].type == arm.ARM_OP_MEM
+                        and operands[1].mem.base == register
+                    ):
+                        if instruction.mnemonic.startswith("str"):
+                            action = "writes"
+                        elif instruction.mnemonic.startswith("ldr"):
+                            action = "reads"
+                    if action is not None:
+                        found[value].append((site, action, instruction.address))
+                        del pending[register]
+                        consumed[register] = value
+                    elif instruction.address - site > 0x40:
+                        found[value].append((site, "forms", None))
+                        del pending[register]
+                        consumed[register] = value
+
+            track(capstone, instruction, True, known, from_slot)
+            for register, value in known.items():
+                if value in wanted and register not in pending:
+                    if consumed.get(register) != value:
+                        pending[register] = (instruction.address, value)
+            for register in list(consumed):
+                if known.get(register) != consumed[register]:
+                    del consumed[register]
+        for register, (site, value) in pending.items():
+            found[value].append((site, "forms", None))
+
+    for target in targets:
+        print()
+        print("=== references to {:#x} ===".format(target))
+        hits = found[target]
+        if not hits:
+            print("(none found — the sweep may have missed it, see the docstring)")
+            continue
+        for site, action, at in sorted(hits):
+            where = symbol_for(data, site) or symbol_for(data, site | 1)
+            print(
+                "{:#010x}  {}{}{}".format(
+                    site,
+                    action,
+                    " at {:#x}".format(at) if at is not None else " the address only",
+                    "   in {}".format(where) if where else "",
+                )
+            )
+
+
 def main(argv):
+    if argv[1:2] == ["--xref"]:
+        if len(argv) < 4:
+            sys.exit(__doc__)
+        try:
+            import capstone
+        except ImportError:
+            die("capstone is not installed (pip install capstone)")
+        data = armv7_slice(find_executable(argv[2]))
+        xref(capstone, data, [int(raw, 16) & ~1 for raw in argv[3:]])
+        return
+
     if len(argv) < 3:
         sys.exit(__doc__)
 

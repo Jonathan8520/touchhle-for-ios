@@ -49,6 +49,11 @@ on:
         type: string
         required: false
         default: ""
+      xref:
+        description: Guest addresses to find the code that reads or writes them, comma-separated hex
+        type: string
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -216,6 +221,27 @@ jobs:
           # shellcheck disable=SC2046
           python3 dev-scripts/disassemble-guest.py downloaded_app/app.ipa \
             $(printf '%s' "$ADDRESSES" | tr ',' ' ') | tee disassembly.txt
+
+      # The other direction: given a global that turned out to be zero, find
+      # the code that is supposed to fill it in.
+      - name: Find the code that references the given addresses
+        if: ${{ always() && inputs.xref != '' }}
+        env:
+          ADDRESSES: ${{ inputs.xref }}
+        run: |
+          set -euo pipefail
+          case "$ADDRESSES" in
+            *[!0-9a-fA-FxX,\ ]*)
+              echo "Addresses must be hexadecimal, separated by commas." >&2
+              exit 2
+              ;;
+          esac
+          python3 -m pip install --quiet capstone \
+            || python3 -m pip install --quiet --break-system-packages capstone
+          # Appended to the same file the report job prints.
+          # shellcheck disable=SC2046
+          python3 dev-scripts/disassemble-guest.py --xref downloaded_app/app.ipa \
+            $(printf '%s' "$ADDRESSES" | tr ',' ' ') | tee -a disassembly.txt
 
       - name: Upload the run log
         if: always()
