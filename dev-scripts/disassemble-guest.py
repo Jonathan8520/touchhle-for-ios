@@ -33,14 +33,19 @@ LC_DYSYMTAB = 0xB
 VM_PROT_EXECUTE = 0x4
 
 SECTION_TYPE = 0xFF
+S_ZEROFILL = 0x1
 S_NON_LAZY_SYMBOL_POINTERS = 0x6
 S_LAZY_SYMBOL_POINTERS = 0x7
 S_SYMBOL_STUBS = 0x8
+S_GB_ZEROFILL = 0xC
+S_THREAD_LOCAL_ZEROFILL = 0x12
 POINTER_SECTION_TYPES = (
     S_NON_LAZY_SYMBOL_POINTERS,
     S_LAZY_SYMBOL_POINTERS,
     S_SYMBOL_STUBS,
 )
+# These have no bytes in the file at all; the loader zeroes them.
+ZEROFILL_SECTION_TYPES = (S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL)
 
 N_STAB = 0xE0
 N_TYPE = 0x0E
@@ -275,10 +280,26 @@ def symbol_for(data, address):
     return "{}+{:#x}".format(best[1], address - best[0])
 
 
+def is_zerofill(data, address):
+    """Whether `address` is in a section the loader zeroes rather than one
+    the file supplies. __bss and __common are the usual ones, and a
+    function pointer living there is an uninitialised global, not an
+    import waiting to be bound."""
+    section = section_for(data, address)
+    return section is not None and section["type"] in ZEROFILL_SECTION_TYPES
+
+
 def file_offset(data, address):
     for vmaddr, vmsize, fileoff, filesize, _initprot in segments(data):
-        if filesize and vmaddr <= address < vmaddr + vmsize:
-            return fileoff + (address - vmaddr)
+        if not filesize or not vmaddr <= address < vmaddr + vmsize:
+            continue
+        # A segment's vmsize can exceed its filesize: the tail is zero-fill
+        # with nothing behind it. Mapping it to a file offset anyway would
+        # read whatever bytes happen to follow in the file and report them
+        # as the contents of a variable.
+        if address - vmaddr >= filesize:
+            return None
+        return fileoff + (address - vmaddr)
     return None
 
 
@@ -309,11 +330,19 @@ def c_string_at(data, address, limit=192):
 
 def describe_pointer(data, address):
     """What the word at `address` is, and what it points at."""
+    slot = tables(data)["indirect"].get(address)
+    if slot is None and is_zerofill(data, address):
+        section = section_for(data, address)
+        return (
+            "in {},{}: zero-filled at load. Nothing binds this — it is an "
+            "uninitialised global, and it reads as 0 until the app writes it.".format(
+                section["segment"], section["name"]
+            )
+        )
     offset = file_offset(data, address)
     if offset is None or offset + 4 > len(data):
         return None
     (word,) = struct.unpack_from("<I", data, offset)
-    slot = tables(data)["indirect"].get(address)
     if slot is not None:
         name, section_name = slot
         return "{} slot for {} (holds {:#x})".format(section_name, name, word)
@@ -362,6 +391,10 @@ def describe_slot(data, slot):
     if entry is not None:
         name, section_name = entry
         return " ({}, {})".format(name, section_name)
+    if is_zerofill(data, slot):
+        return " (in {},{}: zero-filled at load, so an uninitialised global — nothing binds it)".format(
+            section["segment"], section["name"]
+        )
     word = read_word(data, slot)
     if word is None:
         return " (outside the file)"
@@ -546,7 +579,9 @@ def main(argv):
                 ", {},{}".format(section["segment"], section["name"]) if section else "",
             )
         )
-        if file_offset(data, address) is None:
+        # A zero-fill section has no file offset, but it is mapped and worth
+        # describing, so it must not be turned away here.
+        if file_offset(data, address) is None and not is_zerofill(data, address):
             print("not inside any mapped segment")
             continue
         # In code, the useful thing is which function this is inside. In
