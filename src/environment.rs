@@ -2387,13 +2387,33 @@ impl Environment {
     }
 
     fn set_up_initial_env_vars(&mut self) {
-        // TODO: Provide all the system environment variables an app might
-        // expect to find.
-        // Initialize HOME envvar
-        let home_value_cstr = self
-            .mem
-            .alloc_and_write_cstr(self.fs.home_directory().as_str().as_bytes());
-        self.env_vars.insert(b"HOME".to_vec(), home_value_cstr);
+        // iPhone OS starts an app with a small, fixed set of variables. An
+        // app that reads one of them gets NULL back if it isn't set here, and
+        // code that passes the result straight on — `chdir(getenv(…))`,
+        // `strlen(getenv(…))` — then misbehaves in a way that looks nothing
+        // like a missing environment variable. Disney Infinity: Toy Box 3.0
+        // calls chdir(NULL) twice while starting up, for instance.
+        //
+        // The home directory is the emulated one, and the rest match what an
+        // app sees on a device.
+        let home = self.fs.home_directory().to_owned();
+        // iPhone OS gives TMPDIR a trailing slash, and code that builds paths
+        // by concatenation rather than by joining depends on it.
+        let tmp = format!("{}/", home.join("tmp").as_str());
+        for (name, value) in [
+            ("HOME", home.as_str()),
+            // Core Foundation reads this to find the app's container; Apple
+            // documents it in the CFPreferences sources.
+            ("CFFIXED_USER_HOME", home.as_str()),
+            ("TMPDIR", tmp.as_str()),
+            ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+            ("USER", "mobile"),
+            ("LOGNAME", "mobile"),
+            ("SHELL", "/bin/sh"),
+        ] {
+            let value_cstr = self.mem.alloc_and_write_cstr(value.as_bytes());
+            self.env_vars.insert(name.as_bytes().to_vec(), value_cstr);
+        }
     }
 
     fn get_sorted_bin_indices(&self) -> Result<Vec<usize>, String> {
