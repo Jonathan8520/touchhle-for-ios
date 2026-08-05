@@ -25,7 +25,11 @@ on:
       app_url:
         description: Direct link to a decrypted .ipa, or an archive.org item page
         type: string
-        required: true
+        required: false
+      log_run_id:
+        description: Print the log of an earlier run of this workflow, run nothing
+        type: string
+        required: false
       build_ref:
         description: Revision of touchHLE to build (defaults to the dispatch ref)
         type: string
@@ -48,7 +52,7 @@ env:
 jobs:
   run-guest-app:
     name: Run on Linux
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.log_run_id == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -164,3 +168,43 @@ jobs:
           name: guest_app_run_log
           path: run.log
           if-no-files-found: ignore
+
+  # An artifact has to be downloaded to be read, which is awkward when all you
+  # want is to see what the emulator said. This job prints the log into the
+  # workflow's own output, either for the run that just happened or, with
+  # `log_run_id`, for an earlier one.
+  report:
+    name: Report the log
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs: run-guest-app
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Fetch the log
+        uses: actions/download-artifact@main
+        with:
+          name: guest_app_run_log
+          run-id: ${{ inputs.log_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Print the log
+        run: |
+          set -eu
+          lines=$(wc -l < run.log)
+          echo "run.log: $lines lines"
+          echo
+          echo "===== warnings, with addresses folded together ====="
+          grep -aE 'Warning|TODO|nimplemented|not implemented|error|Error' run.log \
+            | sed -E 's/0x[0-9a-fA-F]+/0xX/g; s/[0-9]+/N/g' \
+            | sort | uniq -c | sort -rn | head -60 || true
+          echo
+          if [ "$lines" -le 900 ]; then
+            echo "===== full log ====="
+            cat run.log
+          else
+            echo "===== first 200 lines ====="
+            head -200 run.log
+            echo "===== last 300 lines ====="
+            tail -300 run.log
+          fi

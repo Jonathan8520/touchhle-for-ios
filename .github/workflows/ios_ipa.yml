@@ -16,6 +16,12 @@ name: Build iOS IPA
 # The `.ipa` is always uploaded as a build artifact. It is additionally
 # attached to a GitHub release when a tag matching `ios-v*` is pushed, or when
 # the workflow is dispatched manually with `publish_release` enabled.
+#
+# What it builds is this repository's own core, HyperHLE, and only that one.
+# Shipping the touchHLE core as well means building a second checkout of
+# another repository (see TOUCHHLE_CORE_REPO in build-host.sh), which is not
+# something this workflow can pin or reproduce. An app with one core hides its
+# core picker and runs everything on the core it has.
 
 on:
   push:
@@ -228,13 +234,15 @@ jobs:
         uses: softprops/action-gh-release@master
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}
-          name: touchHLE iOS ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}
           draft: false
           prerelease: true
           fail_on_unmatched_files: true
           body: |
             Unsigned iOS build produced by the `Build iOS IPA` workflow from
             commit ${{ github.sha }}.
+
+            It carries this repository's HyperHLE core alone, so the core
+            picker does not appear and every game runs on HyperHLE.
 
             The IPA contains no Apple ID, certificate, provisioning profile,
             development team, device identifier, game or save. Sign it locally

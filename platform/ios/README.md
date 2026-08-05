@@ -287,6 +287,12 @@ unsigned by construction — which is what the packaging script requires
 anyway. Signing still happens locally, on your own machine, with your own
 Apple account.
 
+The workflow builds this repository's own core, HyperHLE, and only that
+one; the second core lives in another repository that the workflow cannot
+pin. An app with a single core hides its core picker and runs every game
+on the core it has, so such a build is usable, just not identical to a
+hand-made two-core release.
+
 ### Simulator Build
 
 ```sh
