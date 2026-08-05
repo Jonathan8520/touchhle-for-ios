@@ -14,6 +14,14 @@ Usage:
     dev-scripts/disassemble-guest.py <app.ipa | Foo.app | Mach-O> <address>...
     dev-scripts/disassemble-guest.py --xref <app.ipa | ...> <address>...
     dev-scripts/disassemble-guest.py --callchain <app.ipa | ...> <address> [depth]
+    dev-scripts/disassemble-guest.py --class <app.ipa | ...> <name>...
+
+`--class` goes the other way round from an address: given part of a class
+name, it prints that class's methods with the address of each one, plus its
+ivars and their offsets. touchHLE's `--trace-objc` names the selectors an app
+sends; this turns them into addresses to disassemble, and shows the methods
+the app has that it did *not* send, which is usually the more interesting
+half.
 
 `--xref` answers the other question: not "what is at this address" but
 "what code reaches it". It sweeps every executable section following the
@@ -908,6 +916,173 @@ def objc_method_at(data, address):
     )
 
 
+def pointer_list(data, section_name):
+    """The pointers in a section of them, e.g. `__objc_classlist`."""
+    for section in sections(data):
+        if section["name"] != section_name:
+            continue
+        for at in range(section["addr"], section["addr"] + section["size"], 4):
+            word = read_word(data, at)
+            if word:
+                yield word
+
+
+def method_list(data, address):
+    """The (selector, types, IMP) triples of a 32-bit ObjC2 method_list_t.
+
+    The header is {uint32 entsize; uint32 count}, and `entsize` is honoured
+    rather than assumed: a linker is free to grow the entry, and reading a
+    12-byte method_t out of a longer entry would walk out of step and print
+    nonsense from then on."""
+    if not address:
+        return
+    entsize = read_word(data, address)
+    count = read_word(data, address + 4)
+    if not entsize or count is None or count > 4096:
+        return
+    for index in range(count):
+        entry = address + 8 + index * entsize
+        name_pointer = read_word(data, entry)
+        types_pointer = read_word(data, entry + 4)
+        imp = read_word(data, entry + 8)
+        if name_pointer is None:
+            return
+        yield (
+            c_string_at(data, name_pointer, limit=256),
+            c_string_at(data, types_pointer, limit=128) if types_pointer else None,
+            imp or 0,
+        )
+
+
+def ivar_list(data, address):
+    """The ivars of a 32-bit ObjC2 ivar_list_t.
+
+    An ivar_t is {int32 *offset; char *name; char *type; uint32 alignment;
+    uint32 size}; the offset is behind a pointer because the runtime rewrites
+    it when a superclass changes size."""
+    if not address:
+        return
+    entsize = read_word(data, address)
+    count = read_word(data, address + 4)
+    if not entsize or count is None or count > 4096:
+        return
+    for index in range(count):
+        entry = address + 8 + index * entsize
+        offset_pointer = read_word(data, entry)
+        name_pointer = read_word(data, entry + 4)
+        type_pointer = read_word(data, entry + 8)
+        size = read_word(data, entry + 0x10)
+        if name_pointer is None:
+            return
+        yield (
+            c_string_at(data, name_pointer, limit=128),
+            c_string_at(data, type_pointer, limit=128) if type_pointer else None,
+            read_word(data, offset_pointer) if offset_pointer else None,
+            size,
+        )
+
+
+def print_method_list(data, title, address):
+    methods = list(method_list(data, address))
+    if not methods:
+        return
+    print("  {} ({}):".format(title, len(methods)))
+    for name, types, imp in sorted(methods, key=lambda method: method[0] or ""):
+        print(
+            "    {:#010x} (pass {:#x})  {}{}".format(
+                imp & ~1,
+                imp | 1,
+                name,
+                "   {!r}".format(types) if types else "",
+            )
+        )
+
+
+def report_class(data, address):
+    """Print one class: what it inherits from, its methods and its ivars."""
+    name = class_name_at(data, address)
+    class_ro = read_word(data, address + 0x10)
+    superclass = read_word(data, address + 4)
+    print()
+    print(
+        "=== class {} ({:#x}) ===".format(name, address)
+        if name
+        else "=== class at {:#x} ===".format(address)
+    )
+    if superclass:
+        print(
+            "superclass: {} ({:#x})".format(
+                class_name_at(data, superclass) or "?", superclass
+            )
+        )
+    else:
+        # A root class or, far more often, one whose superclass lives in a
+        # system framework and so is bound at load time rather than stored.
+        entry = tables(data)["indirect"].get(address + 4)
+        print("superclass: {}".format(entry[0] if entry else "bound at load time"))
+
+    metaclass = read_word(data, address)
+    if metaclass:
+        metaclass_ro = read_word(data, metaclass + 0x10)
+        if metaclass_ro:
+            print_method_list(data, "class methods", read_word(data, metaclass_ro + 0x14))
+    if not class_ro:
+        print("  (no class_ro — nothing more is stored here)")
+        return
+    print_method_list(data, "instance methods", read_word(data, class_ro + 0x14))
+
+    ivars = list(ivar_list(data, read_word(data, class_ro + 0x1C)))
+    if ivars:
+        print("  ivars ({}):".format(len(ivars)))
+        for ivar_name, ivar_type, offset, size in ivars:
+            print(
+                "    +{}  {} ({} bytes){}".format(
+                    "{:#06x}".format(offset) if offset is not None else "?",
+                    ivar_name,
+                    size,
+                    "   {!r}".format(ivar_type) if ivar_type else "",
+                )
+            )
+
+
+def report_classes(data, wanted):
+    """Print every class and category whose name contains one of `wanted`."""
+    needles = [needle.lower() for needle in wanted]
+
+    def matches(name):
+        return name is not None and any(needle in name.lower() for needle in needles)
+
+    found = False
+    for class_pointer in pointer_list(data, "__objc_classlist"):
+        if matches(class_name_at(data, class_pointer)):
+            found = True
+            report_class(data, class_pointer)
+
+    # A category's methods are on the class at runtime but are stored apart
+    # from it, so a class dump that skipped them would be missing methods the
+    # app definitely has.
+    for category in pointer_list(data, "__objc_catlist"):
+        name_pointer = read_word(data, category)
+        category_name = c_string_at(data, name_pointer, limit=128) if name_pointer else None
+        target = read_word(data, category + 4)
+        target_name = class_name_at(data, target) if target else None
+        if not matches(target_name) and not matches(category_name):
+            continue
+        found = True
+        print()
+        print(
+            "=== category {}({}) ({:#x}) ===".format(
+                target_name or "?", category_name or "?", category
+            )
+        )
+        print_method_list(data, "instance methods", read_word(data, category + 8))
+        print_method_list(data, "class methods", read_word(data, category + 0xC))
+
+    if not found:
+        print("No class or category matched {}.".format(", ".join(wanted)))
+        print("(Only classes the app itself defines are stored in the binary.)")
+
+
 def report_data_references(data, targets):
     hits = data_references(data, targets)
     for target in targets:
@@ -950,6 +1125,13 @@ def report_xrefs(data, targets, found):
 
 
 def main(argv):
+    if argv[1:2] == ["--class"]:
+        if len(argv) < 4:
+            sys.exit(__doc__)
+        data = armv7_slice(find_executable(argv[2]))
+        report_classes(data, argv[3:])
+        return
+
     if argv[1:2] in (["--xref"], ["--callchain"]):
         if len(argv) < 4:
             sys.exit(__doc__)
