@@ -391,6 +391,22 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
     res
 }
 
+/// How many bytes the app has read from its own files, in total.
+///
+/// An app that has gone quiet is either stuck or working, and for a game the
+/// work is nearly always reading and unpacking its own data. A number that
+/// keeps climbing says which of the two it is, and costs an increment per
+/// read to know.
+static BYTES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_bytes_read(count: usize) {
+    BYTES_READ.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn total_bytes_read() -> u64 {
+    BYTES_READ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn read(
     env: &mut Environment,
     fd: FileDescriptor,
@@ -416,6 +432,7 @@ pub fn read(
     let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
     match file.file.read(buffer_slice) {
         Ok(bytes_read) => {
+            record_bytes_read(bytes_read);
             if bytes_read == 0 && size != 0 {
                 file.reached_eof = true;
             }

@@ -1492,11 +1492,12 @@ impl Environment {
             None => format!("{:#x}", pc),
         };
         log!(
-            "guest sample at {:.0}s: thread {} at {}{}",
+            "guest sample at {:.0}s: thread {} at {}{}, {} MiB read from files",
             elapsed,
             self.current_thread,
             where_,
             others,
+            crate::libc::posix_io::total_bytes_read() / (1024 * 1024),
         );
     }
 
