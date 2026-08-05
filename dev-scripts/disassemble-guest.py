@@ -1011,6 +1011,15 @@ def main(argv):
                     entry, entry | 1 if thumb else entry
                 )
             )
+            # If the binary stores that entry in its Objective-C metadata,
+            # the function is a method, and its name says far more than its
+            # address does.
+            for _segment, section_name, at in data_references(data, [entry])[entry]:
+                if section_name != "__objc_const":
+                    continue
+                described = objc_method_at(data, at)
+                if described is not None and described.startswith("the IMP"):
+                    print("  it is {}".format(described))
         known, from_slot = {}, {}
         for instruction in instructions:
             note = annotate(capstone, data, instruction, thumb, known, from_slot)
