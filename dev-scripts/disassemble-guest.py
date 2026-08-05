@@ -867,6 +867,24 @@ def data_references(data, targets):
     return hits
 
 
+def objc_method_at(data, imp_address):
+    """The selector and type encoding of the method whose IMP is here.
+
+    A 32-bit ObjC2 method_t is {SEL name; const char *types; IMP imp}, so
+    a function address found in __objc_const is the third word of one and
+    the two before it name it. That is how a function nothing branches to
+    turns out to be a method."""
+    name_pointer = read_word(data, imp_address - 8)
+    types_pointer = read_word(data, imp_address - 4)
+    if not name_pointer or not types_pointer:
+        return None
+    selector = c_string_at(data, name_pointer, limit=256)
+    types = c_string_at(data, types_pointer, limit=64)
+    if selector is None:
+        return None
+    return selector, types
+
+
 def report_data_references(data, targets):
     hits = data_references(data, targets)
     for target in targets:
@@ -877,7 +895,15 @@ def report_data_references(data, targets):
             print("(nowhere — no pointer table in the binary holds it)")
             continue
         for segment, name, at in sorted(found, key=lambda hit: hit[2]):
-            print("{:#010x}  in {},{}".format(at, segment, name))
+            note = ""
+            if name == "__objc_const":
+                method = objc_method_at(data, at)
+                if method is not None:
+                    selector, types = method
+                    note = "   the IMP of a method named {!r}{}".format(
+                        selector, " (types {!r})".format(types) if types else ""
+                    )
+            print("{:#010x}  in {},{}{}".format(at, segment, name, note))
 
 
 def report_xrefs(data, targets, found):
