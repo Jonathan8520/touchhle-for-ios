@@ -314,6 +314,14 @@ fn log10(env: &mut Environment, arg: f64) -> f64 {
     set_errno(env, 0);
     arg.log10()
 }
+// `long double` is just `double` on 32-bit ARM Apple platforms, so every `l`
+// variant is its `double` counterpart. They are worth having because an
+// unimplemented function gets a stub that returns 0, and a math function
+// that quietly returns zero corrupts whatever the app computes from it
+// instead of failing somewhere visible.
+fn log10l(env: &mut Environment, arg: f64) -> f64 {
+    log10(env, arg)
+}
 fn log10f(env: &mut Environment, arg: f32) -> f32 {
     // TODO: handle errno properly
     set_errno(env, 0);
@@ -535,6 +543,10 @@ fn fmodf(env: &mut Environment, arg1: f32, arg2: f32) -> f32 {
     set_errno(env, 0);
     arg1 % arg2
 }
+// See the note on log10l() about `long double`.
+fn fmodl(env: &mut Environment, arg1: f64, arg2: f64) -> f64 {
+    fmod(env, arg1, arg2)
+}
 
 // Maximum, minimum and positive difference functions
 // TODO: implement fdim
@@ -582,34 +594,32 @@ fn _ZNSt6vectorIN8InputMgr7KeyDataESaIS1_EE14_M_fill_insertEN9__gnu_cxx17__norma
     arg1.min(arg2)
 }
 
+// nearbyint() is rint() without raising the "inexact" floating-point
+// exception. touchHLE doesn't model floating-point exceptions, so the two
+// are the same function here, and both have to honour the rounding
+// direction the guest set with fesetround().
 fn nearbyintf(env: &mut Environment, arg: f32) -> f32 {
-    // TODO: handle errno properly
-    set_errno(env, 0);
-    arg.log10()
+    rint(env, arg.into()) as f32
 }
 
 fn nearbyint(env: &mut Environment, arg: f64) -> f64 {
-    // TODO: handle errno properly
-    set_errno(env, 0);
-    arg.log10()
+    rint(env, arg)
 }
 
-fn llroundf(env: &mut Environment, arg: f32) -> f32 {
-    // TODO: handle errno properly
-    set_errno(env, 0);
-    arg.log10()
+fn llroundf(env: &mut Environment, arg: f32) -> i64 {
+    llround(env, arg.into())
 }
 
-fn llround(env: &mut Environment, arg: f64) -> f64 {
+fn llround(env: &mut Environment, arg: f64) -> i64 {
     // TODO: handle errno properly
     set_errno(env, 0);
-    arg.log10()
+    // Unlike llrint(), llround() always rounds halfway cases away from zero,
+    // whatever the current rounding direction is.
+    arg.clamp(i64::MIN as f64, i64::MAX as f64).round() as i64
 }
 
 fn rintf(env: &mut Environment, arg: f32) -> f32 {
-    // TODO: handle errno properly
-    set_errno(env, 0);
-    arg.log10()
+    rint(env, arg.into()) as f32
 }
 
 // Other
@@ -641,14 +651,25 @@ const FP_ZERO: GuestFPCategory = 3;
 const FP_NORMAL: GuestFPCategory = 4;
 const FP_SUBNORMAL: GuestFPCategory = 5;
 
-fn __fpclassifyf(_env: &mut Environment, arg: f32) -> GuestFPCategory {
-    match arg.classify() {
+fn fp_category(category: FpCategory) -> GuestFPCategory {
+    match category {
         FpCategory::Nan => FP_NAN,
         FpCategory::Infinite => FP_INFINITE,
         FpCategory::Zero => FP_ZERO,
         FpCategory::Normal => FP_NORMAL,
         FpCategory::Subnormal => FP_SUBNORMAL,
     }
+}
+
+fn __fpclassifyf(_env: &mut Environment, arg: f32) -> GuestFPCategory {
+    fp_category(arg.classify())
+}
+
+// The classification must be done on the `double` itself: a subnormal
+// `float` becomes a perfectly normal `double`, so widening the argument and
+// reusing __fpclassifyf() would give the wrong answer.
+fn __fpclassifyd(_env: &mut Environment, arg: f64) -> GuestFPCategory {
+    fp_category(arg.classify())
 }
 
 // Type-specific classification helpers from `<math.h>`. The standard
@@ -929,6 +950,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(log2f(_)),
     export_c_func!(log10(_)),
     export_c_func!(log10f(_)),
+    export_c_func!(log10l(_)),
     export_c_func!(exp(_)),
     export_c_func!(expf(_)),
     export_c_func!(expm1(_)),
@@ -966,6 +988,7 @@ pub const FUNCTIONS: FunctionExports = &[
     // Remainder functions
     export_c_func!(fmod(_, _)),
     export_c_func!(fmodf(_, _)),
+    export_c_func!(fmodl(_, _)),
     // Maximum, minimum and positive difference functions
     export_c_func!(fmax(_, _)),
     export_c_func!(fmaxf(_, _)),
@@ -985,6 +1008,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(hypot(_, _)),
     export_c_func!(hypotf(_, _)),
     export_c_func!(__fpclassifyf(_)),
+    export_c_func!(__fpclassifyd(_)),
     export_c_func!(__isnanf(_)),
     export_c_func!(__isnand(_)),
     export_c_func!(__isinff(_)),
