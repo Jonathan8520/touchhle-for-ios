@@ -1736,7 +1736,8 @@ impl Dyld {
         let function_ptr: MutPtr<u32> = function_ptr.cast();
         mem.write(function_ptr + 0, encode_a32_svc(svc));
         mem.write(function_ptr + 1, encode_a32_ret());
-        self.host_function_names.insert(function_ptr.to_bits(), symbol);
+        self.host_function_names
+            .insert(function_ptr.to_bits(), symbol);
         GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
     }
 
