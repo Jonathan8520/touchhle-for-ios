@@ -631,6 +631,16 @@ def sweep_section(capstone, code, section, found, wanted):
             # by the `add rD,pc` on this line; what happens to it next says
             # whether this site reads the global or writes it.
             operands = instruction.operands
+
+            # A target can also be a function, in which case what matters is
+            # who branches to it.
+            if instruction.mnemonic.startswith("b") and operands:
+                if operands[0].type == arm.ARM_OP_IMM:
+                    destination = operands[0].imm & ~1
+                    if destination in wanted:
+                        found[destination].append(
+                            (instruction.address, "calls", None)
+                        )
             if pending:
                 for register, (site, value) in list(pending.items()):
                     action = None
@@ -684,12 +694,15 @@ def report_xrefs(data, targets, found):
             continue
         for site, action, at in hits:
             where = symbol_for(data, site) or symbol_for(data, site | 1)
+            if action == "calls":
+                detail = ""
+            elif at is not None:
+                detail = " at {:#x}".format(at)
+            else:
+                detail = " the address only"
             print(
                 "{:#010x}  {}{}{}".format(
-                    site,
-                    action,
-                    " at {:#x}".format(at) if at is not None else " the address only",
-                    "   in {}".format(where) if where else "",
+                    site, action, detail, "   in {}".format(where) if where else ""
                 )
             )
 
