@@ -1633,6 +1633,22 @@ impl Environment {
                 stack.join(" <- ")
             },
         );
+        // What the guest asks the emulator for says what it is doing. A
+        // thread spinning on a lock and a thread decompressing a file look
+        // identical from a program counter, and quite different from here.
+        let busiest: Vec<String> = self
+            .dyld
+            .busiest_host_functions(6)
+            .into_iter()
+            .map(|(symbol, count)| format!("{} x{}", symbol, count))
+            .collect();
+        if !busiest.is_empty() {
+            log!(
+                "guest sample at {:.0}s: most-called so far: {}",
+                elapsed,
+                busiest.join(", ")
+            );
+        }
     }
 
     pub fn run(mut self) {

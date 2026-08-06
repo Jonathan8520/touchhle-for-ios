@@ -408,6 +408,13 @@ pub struct Dyld {
     /// no host function, so the warning can be rate-limited. See
     /// [Self::get_svc_handler].
     unexpected_svcs: HashMap<(u32, u32), u64>,
+    /// How many times the guest has called each host function.
+    ///
+    /// An app that has gone quiet is doing *something*, and what it asks the
+    /// emulator for says what. A thread spinning on a lock and a thread
+    /// decompressing a file look identical from a program counter, and quite
+    /// different from here.
+    host_function_calls: HashMap<&'static str, u64>,
 }
 
 impl Dyld {
@@ -440,6 +447,7 @@ impl Dyld {
             non_lazy_host_functions: HashMap::new(),
             host_function_names: HashMap::new(),
             unexpected_svcs: HashMap::new(),
+            host_function_calls: HashMap::new(),
         }
     }
 
@@ -1469,6 +1477,7 @@ impl Dyld {
                     return None;
                 };
                 log_dbg!("Call to host function, already linked: {}", symbol);
+                *self.host_function_calls.entry(symbol).or_insert(0) += 1;
                 Some(f)
             }
         }
@@ -1750,6 +1759,21 @@ impl Dyld {
             .get(&(addr & !7))
             .or_else(|| self.host_function_names.get(&((addr - 4) & !7)))
             .copied()
+    }
+
+    /// The host functions the guest has called most, and how often, most
+    /// frequent first. At most `limit` of them.
+    pub fn busiest_host_functions(&self, limit: usize) -> Vec<(&'static str, u64)> {
+        let mut counts: Vec<(&'static str, u64)> = self
+            .host_function_calls
+            .iter()
+            .map(|(&symbol, &count)| (symbol, count))
+            .collect();
+        // Ties broken by name so repeated samples of the same workload read
+        // the same way rather than shuffling.
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        counts.truncate(limit);
+        counts
     }
 }
 
