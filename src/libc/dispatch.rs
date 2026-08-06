@@ -16,6 +16,7 @@ use crate::dyld::{
     export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant,
 };
 use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
+use crate::libc::semaphore::sem_t;
 use crate::Environment;
 use std::collections::HashMap;
 
@@ -451,39 +452,65 @@ fn dispatch_group_notify_f(
 
 // MARK: - dispatch_semaphore
 
+/// A dispatch semaphore is backed by one of libc's, so that waiting on it
+/// actually blocks the calling thread and signalling it actually wakes one.
+///
+/// The handle the guest gets is the address of the `sem_t`, which is what
+/// [crate::libc::semaphore] keys its own bookkeeping on.
 fn dispatch_semaphore_create(env: &mut Environment, value: i64) -> dispatch_semaphore_t {
-    let handle = {
-        let st = get_state(env);
-        st.next_queue_handle += 2;
-        let h = st.next_queue_handle | 0x0300_0000;
-        st.semaphores.insert(h, value);
-        h
-    };
-    MutVoidPtr::from_bits(handle)
+    let sem: MutPtr<sem_t> = env.mem.alloc_and_write(0);
+    // A negative or absurd initial value is a guest bug; clamp rather than
+    // panic, since the guest is about to find out either way.
+    let value = value.clamp(0, i64::from(u32::MAX)) as u32;
+    crate::libc::semaphore::sem_init(env, sem, 0, value);
+    sem.cast()
 }
 
-fn dispatch_semaphore_wait(env: &mut Environment, sem: dispatch_semaphore_t, _timeout: u64) -> i32 {
-    let key = sem.to_bits();
-    let st = get_state(env);
-    if let Some(val) = st.semaphores.get_mut(&key) {
-        *val -= 1;
-        0 // success
-    } else {
-        log!("dispatch_semaphore_wait: unknown semaphore {:?}", sem);
-        -1
+/// ```c
+/// long dispatch_semaphore_wait(dispatch_semaphore_t dsema, dispatch_time_t timeout);
+/// ```
+///
+/// Returns zero once the semaphore has been acquired, non-zero if the timeout
+/// passed first.
+///
+/// This used to decrement the count and return success without ever waiting,
+/// even when the count went negative — so a thread waiting for work that had
+/// not been done yet carried straight on as though it had.
+fn dispatch_semaphore_wait(env: &mut Environment, sem: dispatch_semaphore_t, timeout: u64) -> i32 {
+    let sem: MutPtr<sem_t> = sem.cast();
+    if timeout == DISPATCH_TIME_NOW {
+        return match env.sem_decrement(sem, false) {
+            true => 0,
+            // Apple returns KERN_OPERATION_TIMED_OUT here; all a caller can
+            // do with it is distinguish it from zero.
+            false => 49,
+        };
+    }
+    // A finite timeout is treated as an unbounded one. Waiting too long is
+    // survivable in a way that not waiting at all is not, and no guest seen so
+    // far uses a dispatch semaphore for anything but "wait until this is
+    // done".
+    if timeout != DISPATCH_TIME_FOREVER {
+        log_once_finite_timeout(timeout);
+    }
+    env.sem_decrement(sem, true);
+    0
+}
+
+fn log_once_finite_timeout(timeout: u64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        log!(
+            "dispatch_semaphore_wait() called with a finite timeout ({:#x});              touchHLE waits without a deadline. [this log will only be shown once]",
+            timeout
+        );
     }
 }
 
 fn dispatch_semaphore_signal(env: &mut Environment, sem: dispatch_semaphore_t) -> i32 {
-    let key = sem.to_bits();
-    let st = get_state(env);
-    if let Some(val) = st.semaphores.get_mut(&key) {
-        *val += 1;
-        0
-    } else {
-        log!("dispatch_semaphore_signal: unknown semaphore {:?}", sem);
-        0
-    }
+    env.sem_increment(sem.cast());
+    0
 }
 
 // MARK: - dispatch_source (stub)
