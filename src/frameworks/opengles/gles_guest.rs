@@ -2968,11 +2968,13 @@ fn glGetShaderPrecisionFormat(
     });
 }
 fn glAttachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
+    record_shader_attached(program, shader, true);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.AttachShader(program, shader)
     });
 }
 fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
+    record_shader_attached(program, shader, false);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.DetachShader(program, shader)
     });
@@ -3008,10 +3010,112 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                     max_attribs,
                     listed.join(", ")
                 );
+                if s.contains("aliasing") {
+                    relink_without_phantom_bindings(gles, program, &requested, max_attribs);
+                }
             }
         }
     });
 }
+/// Try once more to link a program the driver rejected for attribute
+/// aliasing, having moved aside the bindings its shaders do not declare.
+///
+/// An app that binds one set of attribute names for all of its programs asks
+/// each program for names it does not have. Binding a name that is not an
+/// active attribute is defined to have no effect, so a driver is free to
+/// ignore it — and PowerVR, which these apps shipped against, does. Apple's
+/// driver counts the request itself and refuses to link when two land on one
+/// slot, which is how Disney Infinity's sprite program dies with "Slot 8
+/// unavailable for 'i_sprite0'" while `i_texcoord0` holds slot 8.
+///
+/// There is no call to take a binding back, so a name to be moved out of the
+/// way has to be bound somewhere else. Only names no attached shader declares
+/// are moved: for those the binding was already a no-op, so moving it changes
+/// nothing the program can observe. If both names on a slot are declared, the
+/// conflict is real and this leaves it alone rather than silently feeding an
+/// attribute from the wrong slot.
+///
+/// This runs only where the link has already failed, so the program is
+/// unusable either way and there is nothing to regress.
+unsafe fn relink_without_phantom_bindings(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    requested: &[(GLuint, String)],
+    max_attribs: GLint,
+) {
+    use std::collections::HashSet;
+
+    let taken: HashSet<GLuint> = requested.iter().map(|(slot, _)| *slot).collect();
+    let mut free_slots = (0..max_attribs.max(0) as GLuint).filter(|slot| !taken.contains(slot));
+
+    let mut moved = Vec::new();
+    for slot in taken.iter().copied() {
+        let on_this_slot: Vec<&(GLuint, String)> =
+            requested.iter().filter(|(at, _)| *at == slot).collect();
+        if on_this_slot.len() < 2 {
+            continue;
+        }
+        // Keep one. Prefer keeping a declared attribute; move the ones the
+        // shaders never mention.
+        let declared: Vec<bool> = on_this_slot
+            .iter()
+            .map(|(_, name)| attribute_is_declared(program, name).unwrap_or(true))
+            .collect();
+        if declared.iter().filter(|d| **d).count() != 1 {
+            log!(
+                "Program {}: slot {} is claimed by {} bindings and {} of them are declared \
+                 by the shaders, so which one the app means cannot be told from here; \
+                 leaving it as it is.",
+                program,
+                slot,
+                on_this_slot.len(),
+                declared.iter().filter(|d| **d).count()
+            );
+            continue;
+        }
+        for (index, (_, name)) in on_this_slot.iter().enumerate() {
+            if declared[index] {
+                continue;
+            }
+            let Some(free) = free_slots.next() else {
+                log!(
+                    "Program {}: no free attribute slot to move {:?} to.",
+                    program,
+                    name
+                );
+                break;
+            };
+            let Ok(cstr) = std::ffi::CString::new(name.as_str()) else {
+                continue;
+            };
+            gles.BindAttribLocation(program, free, cstr.as_ptr());
+            moved.push(format!("{:?} from slot {} to {}", name, slot, free));
+        }
+    }
+
+    if moved.is_empty() {
+        return;
+    }
+    gles.LinkProgram(program);
+    let mut ok: GLint = 0;
+    gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
+    if ok != 0 {
+        log!(
+            "Program {} linked after moving {} — the shaders do not declare \
+             {}, so the binding had no effect to lose.",
+            program,
+            moved.join(" and "),
+            if moved.len() == 1 { "it" } else { "them" }
+        );
+    } else {
+        log!(
+            "Program {} still does not link after moving {}.",
+            program,
+            moved.join(" and ")
+        );
+    }
+}
+
 fn glValidateProgram(env: &mut Environment, program: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.ValidateProgram(program) });
 }
@@ -3429,10 +3533,80 @@ fn glShaderSource(
             shader
         );
     }
+    record_shader_source(shader, &cs.to_string_lossy());
     let ptr = cs.as_ptr();
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.ShaderSource(shader, 1, &ptr, std::ptr::null());
     });
+}
+
+/// The source last given to each shader, and the shaders attached to each
+/// program.
+///
+/// Kept so that a link failure can be answered with what the shaders actually
+/// declare. A driver reports which attribute binding it could not honour, but
+/// not whether that attribute exists in the shader at all — and an app that
+/// binds one set of names for every one of its programs asks for names most of
+/// them do not have.
+static SHADER_SOURCES: std::sync::Mutex<Option<std::collections::HashMap<GLuint, String>>> =
+    std::sync::Mutex::new(None);
+static PROGRAM_SHADERS: std::sync::Mutex<Option<std::collections::HashMap<GLuint, Vec<GLuint>>>> =
+    std::sync::Mutex::new(None);
+
+fn record_shader_source(shader: GLuint, source: &str) {
+    if let Ok(mut sources) = SHADER_SOURCES.lock() {
+        sources
+            .get_or_insert_with(Default::default)
+            .insert(shader, source.to_string());
+    }
+}
+
+fn record_shader_attached(program: GLuint, shader: GLuint, attached: bool) {
+    let Ok(mut programs) = PROGRAM_SHADERS.lock() else {
+        return;
+    };
+    let shaders = programs
+        .get_or_insert_with(Default::default)
+        .entry(program)
+        .or_default();
+    shaders.retain(|&existing| existing != shader);
+    if attached {
+        shaders.push(shader);
+    }
+}
+
+/// Whether any shader attached to `program` declares `name` as an attribute.
+///
+/// Returns `None` when the sources are not all known, so a caller can tell
+/// "not declared" from "cannot say".
+fn attribute_is_declared(program: GLuint, name: &str) -> Option<bool> {
+    let (Ok(programs), Ok(sources)) = (PROGRAM_SHADERS.lock(), SHADER_SOURCES.lock()) else {
+        return None;
+    };
+    let shaders = programs.as_ref()?.get(&program)?;
+    if shaders.is_empty() {
+        return None;
+    }
+    let sources = sources.as_ref()?;
+    let mut declared = false;
+    for shader in shaders {
+        let source = sources.get(shader)?;
+        for line in source.lines() {
+            // GLSL ES 1.00 spells it `attribute vec2 i_texcoord0;`. Matching
+            // the identifier as a whole word keeps `i_texcoord0` from
+            // answering for `i_texcoord01`.
+            if !line.contains("attribute") {
+                continue;
+            }
+            if line
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == name)
+            {
+                declared = true;
+            }
+        }
+    }
+    Some(declared)
 }
 
 /// One of the source strings handed to `glShaderSource`, up to its first NUL.
@@ -5787,5 +5961,65 @@ mod shader_source_tests {
     fn a_leading_nul_yields_nothing_rather_than_the_rest() {
         // Truncating is what a C driver reading this as a string would do.
         assert_eq!(shader_source_piece(b"\0void main(){}"), b"");
+    }
+}
+
+#[cfg(test)]
+mod attribute_declaration_tests {
+    use super::*;
+
+    fn with_source(shader: GLuint, program: GLuint, source: &str) {
+        record_shader_source(shader, source);
+        record_shader_attached(program, shader, true);
+    }
+
+    #[test]
+    fn a_name_the_shader_declares_is_found_and_one_it_does_not_is_not() {
+        // Program 11 of Disney Infinity: the app binds both i_sprite0 and
+        // i_texcoord0 to slot 8, and only one of them is in this shader.
+        with_source(
+            901,
+            801,
+            "attribute vec4 i_pivot;\n\
+             attribute vec4 i_color;\n\
+             attribute vec2 i_texcoord0;\n\
+             void main() { gl_Position = i_pivot; }\n",
+        );
+        assert_eq!(attribute_is_declared(801, "i_texcoord0"), Some(true));
+        assert_eq!(attribute_is_declared(801, "i_pivot"), Some(true));
+        assert_eq!(attribute_is_declared(801, "i_sprite0"), Some(false));
+    }
+
+    #[test]
+    fn a_longer_name_does_not_answer_for_a_shorter_one() {
+        with_source(902, 802, "attribute vec2 i_texcoord01;\nvoid main() {}\n");
+        assert_eq!(attribute_is_declared(802, "i_texcoord0"), Some(false));
+        assert_eq!(attribute_is_declared(802, "i_texcoord01"), Some(true));
+    }
+
+    #[test]
+    fn a_use_without_a_declaration_does_not_count() {
+        // Only the declaration decides; a uniform of the same name must not
+        // make an attribute binding look real.
+        with_source(
+            903,
+            803,
+            "uniform vec4 i_sprite0;\nvoid main() { gl_Position = i_sprite0; }\n",
+        );
+        assert_eq!(attribute_is_declared(803, "i_sprite0"), Some(false));
+    }
+
+    #[test]
+    fn an_unknown_program_says_it_cannot_tell_rather_than_no() {
+        assert_eq!(attribute_is_declared(8040, "i_sprite0"), None);
+    }
+
+    #[test]
+    fn detaching_a_shader_removes_what_it_declared() {
+        with_source(905, 805, "attribute vec2 i_texcoord0;\nvoid main() {}\n");
+        assert_eq!(attribute_is_declared(805, "i_texcoord0"), Some(true));
+        record_shader_attached(805, 905, false);
+        // No shaders left, so there is nothing to answer from.
+        assert_eq!(attribute_is_declared(805, "i_texcoord0"), None);
     }
 }
