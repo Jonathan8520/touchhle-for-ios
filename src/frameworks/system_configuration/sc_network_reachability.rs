@@ -142,14 +142,13 @@ fn SCNetworkReachabilityGetFlags(
         log_once!(
             "SCNetworkReachabilityGetFlags: reporting the network as reachable \
              because --claim-network-reachable was given, though touchHLE has \
-             no network stack [this log will only be shown once]"
+             no network stack"
         );
     } else {
         log_once!(
             "SCNetworkReachabilityGetFlags: reporting the network as \
              unreachable, because touchHLE has no network stack. Pass \
-             --claim-network-reachable to say otherwise [this log will only \
-             be shown once]"
+             --claim-network-reachable to say otherwise"
         );
     }
     env.mem.write(
