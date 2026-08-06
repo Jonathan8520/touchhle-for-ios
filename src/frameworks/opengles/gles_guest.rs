@@ -2810,6 +2810,43 @@ fn glCreateProgram(env: &mut Environment) -> GLuint {
 fn glCreateShader(env: &mut Environment, type_: GLenum) -> GLuint {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.CreateShader(type_) })
 }
+/// The attribute slots each program has been asked to bind, so that a link
+/// failure can say which request collided with which.
+///
+/// A vertex attribute of a matrix type occupies as many consecutive slots as
+/// it has columns, so two requests that look far apart can still overlap —
+/// and a driver that optimises an unused attribute away will not notice while
+/// a stricter one refuses to link. Without the list, "Slot 8 unavailable"
+/// names only the loser.
+static ATTRIB_BINDINGS: std::sync::Mutex<
+    Option<std::collections::HashMap<GLuint, Vec<(GLuint, String)>>>,
+> = std::sync::Mutex::new(None);
+
+fn record_attrib_binding(program: GLuint, index: GLuint, name: &str) {
+    let Ok(mut bindings) = ATTRIB_BINDINGS.lock() else {
+        return;
+    };
+    let bindings = bindings.get_or_insert_with(Default::default);
+    let for_program = bindings.entry(program).or_default();
+    // A program relinked after rebinding should not accumulate both sets.
+    for_program.retain(|(_, existing)| existing != name);
+    for_program.push((index, name.to_string()));
+}
+
+/// The slots requested for `program`, lowest first.
+fn attrib_bindings_for(program: GLuint) -> Vec<(GLuint, String)> {
+    let Ok(bindings) = ATTRIB_BINDINGS.lock() else {
+        return Vec::new();
+    };
+    let mut requested = bindings
+        .as_ref()
+        .and_then(|bindings| bindings.get(&program))
+        .cloned()
+        .unwrap_or_default();
+    requested.sort();
+    requested
+}
+
 fn glBindAttribLocation(
     env: &mut Environment,
     program: GLuint,
@@ -2818,6 +2855,7 @@ fn glBindAttribLocation(
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let cstr = read_guest_cstring(mem, name);
+        record_attrib_binding(program, index, &cstr.to_string_lossy());
         gles.BindAttribLocation(program, index, cstr.as_ptr());
     });
 }
@@ -2954,6 +2992,23 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
             ))
             .unwrap_or("?");
             log!("Program {} link failed: {}", program, s);
+            // Which slots the app asked for is the other half of an
+            // aliasing complaint, and the driver only reports the loser.
+            let requested = attrib_bindings_for(program);
+            if !requested.is_empty() {
+                let listed: Vec<String> = requested
+                    .iter()
+                    .map(|(index, name)| format!("{} -> {:?}", index, name))
+                    .collect();
+                let mut max_attribs: GLint = 0;
+                gles.GetIntegerv(0x8869 /* GL_MAX_VERTEX_ATTRIBS */, &mut max_attribs);
+                log!(
+                    "Program {} was asked to bind these attribute slots (driver has {}): {}",
+                    program,
+                    max_attribs,
+                    listed.join(", ")
+                );
+            }
         }
     });
 }
