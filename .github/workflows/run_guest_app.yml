@@ -348,6 +348,16 @@ jobs:
             size=$(identify -format '%wx%h' "$shot" 2>/dev/null || echo '?')
             echo "$shot: $size, mean brightness $mean/255, std dev $sd, $colours distinct colours"
           done
+          # The artifact is the good copy, but the artifact store is not
+          # reachable from everywhere this log is read. A downscaled PNG,
+          # base64'd, travels wherever the log does.
+          last=$(ls screenshot-final.png 2>/dev/null || ls screenshot-*.png | tail -1)
+          if [ -n "$last" ]; then
+            convert "$last" -resize 320x480 -strip inline.png
+            echo "===== $last, downscaled, as base64 png ====="
+            base64 -w 120 inline.png
+            echo "===== end of base64 png ====="
+          fi
 
       - name: Upload the screenshots
         if: ${{ always() }}
