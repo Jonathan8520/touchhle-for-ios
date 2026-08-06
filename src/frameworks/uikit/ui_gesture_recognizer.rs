@@ -22,7 +22,7 @@ pub const UISwipeGestureRecognizerDirectionUp: UISwipeGestureRecognizerDirection
 pub const UISwipeGestureRecognizerDirectionDown: UISwipeGestureRecognizerDirection = 1 << 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GestureKind {
+pub(super) enum GestureKind {
     Generic,
     Tap,
     Swipe,
@@ -50,7 +50,7 @@ pub(super) struct UIGestureRecognizerHostObject {
 impl HostObject for UIGestureRecognizerHostObject {}
 
 impl UIGestureRecognizerHostObject {
-    fn new(kind: GestureKind) -> Self {
+    pub(super) fn new(kind: GestureKind) -> Self {
         Self {
             target: nil,
             action: None,

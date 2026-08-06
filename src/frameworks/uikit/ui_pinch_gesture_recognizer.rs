@@ -13,16 +13,32 @@
 //! Apple documentation:
 //! - <https://developer.apple.com/documentation/uikit/uipinchgesturerecognizer>
 
+use super::ui_gesture_recognizer::{GestureKind, UIGestureRecognizerHostObject};
 use crate::frameworks::core_graphics::CGFloat;
-use crate::objc::{id, objc_classes, ClassExports, HostObject, NSZonePtr};
+use crate::objc::{id, impl_HostObject_with_superclass, objc_classes, ClassExports, NSZonePtr};
 
 // MARK: - UIPinchGestureRecognizer host object
-#[derive(Default)]
+
+/// The superclass host object has to be embedded here, or every method
+/// `UIPinchGestureRecognizer` inherits — its state, its view, its target and
+/// action — fails to find the object it is asking for.
 struct UIPinchGestureRecognizerHostObject {
+    superclass: UIGestureRecognizerHostObject,
     scale: CGFloat,
     velocity: CGFloat,
 }
-impl HostObject for UIPinchGestureRecognizerHostObject {}
+impl_HostObject_with_superclass!(UIPinchGestureRecognizerHostObject);
+
+impl Default for UIPinchGestureRecognizerHostObject {
+    fn default() -> Self {
+        Self {
+            superclass: Default::default(),
+            // A pinch that has not happened has not changed the scale.
+            scale: 1.0,
+            velocity: 0.0,
+        }
+    }
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -36,8 +52,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(UIPinchGestureRecognizerHostObject {
-        scale: 1.0,
-        velocity: 0.0,
+        superclass: UIGestureRecognizerHostObject::new(GestureKind::Generic),
+        ..Default::default()
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }

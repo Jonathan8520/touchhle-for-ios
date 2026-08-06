@@ -25,13 +25,17 @@
 //!
 //! Эта реализация повторяет структуру `UIPinchGestureRecognizer`.
 
+use super::ui_gesture_recognizer::{GestureKind, UIGestureRecognizerHostObject};
 use crate::frameworks::core_graphics::CGFloat;
-use crate::objc::{id, objc_classes, ClassExports, HostObject, NSZonePtr};
+use crate::objc::{id, impl_HostObject_with_superclass, objc_classes, ClassExports, NSZonePtr};
 
 // MARK: - UIRotationGestureRecognizer host object
 
-#[derive(Default)]
+/// The superclass host object has to be embedded here, or every method
+/// `UIRotationGestureRecognizer` inherits — its state, its view, its target
+/// and action — fails to find the object it is asking for.
 struct UIRotationGestureRecognizerHostObject {
+    superclass: UIGestureRecognizerHostObject,
     /// Текущий угол поворота в радианах относительно начала распознавания
     /// жеста. По умолчанию 0.
     rotation: CGFloat,
@@ -40,7 +44,17 @@ struct UIRotationGestureRecognizerHostObject {
     /// эмулирующий распознавание, мог его обновлять.
     velocity: CGFloat,
 }
-impl HostObject for UIRotationGestureRecognizerHostObject {}
+impl_HostObject_with_superclass!(UIRotationGestureRecognizerHostObject);
+
+impl Default for UIRotationGestureRecognizerHostObject {
+    fn default() -> Self {
+        Self {
+            superclass: Default::default(),
+            rotation: 0.0,
+            velocity: 0.0,
+        }
+    }
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -54,8 +68,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(UIRotationGestureRecognizerHostObject {
-        rotation: 0.0,
-        velocity: 0.0,
+        superclass: UIGestureRecognizerHostObject::new(GestureKind::Generic),
+        ..Default::default()
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
