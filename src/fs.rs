@@ -570,6 +570,35 @@ fn record_open(path: &GuestPath, succeeded: bool) {
     }
     last.clear();
     last.push_str(path.as_str());
+    drop(opens);
+    if !succeeded {
+        report_open_failed(path);
+    }
+}
+
+/// Say once, for each distinct path, that the guest asked for a file that is
+/// not there.
+///
+/// Looking for a file that does not exist is completely ordinary — that is how
+/// an app finds out which of several optional resources it has, and how
+/// NSBundle searches its localisations — so this is not a warning. But when an
+/// app stops, the file it could not find is often the reason, and a name is
+/// something to go and look for in the bundle.
+fn report_open_failed(path: &GuestPath) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static REPORTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    // A guest that probes in a loop should not be able to fill the log.
+    const LIMIT: usize = 200;
+
+    let Ok(mut reported) = REPORTED.lock() else {
+        return;
+    };
+    let reported = reported.get_or_insert_with(HashSet::new);
+    if reported.len() >= LIMIT || !reported.insert(path.as_str().to_string()) {
+        return;
+    }
+    log!("Note: the app looked for {:?} and it is not there", path);
 }
 
 /// `(files opened, opens that failed, last path asked for)`.

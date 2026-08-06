@@ -64,6 +64,11 @@ on:
         type: string
         required: false
         default: ""
+      list_files:
+        description: Case-insensitive substring; lists the bundle entries whose path contains it
+        type: string
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -221,6 +226,30 @@ jobs:
                   "LSApplicationCategoryType",
               ):
                   print("{} = {!r}".format(key, info[key]))
+          PY
+
+      # When an app asks for a file and does not get it, the question is
+      # whether the file is absent, spelled differently, or somewhere else in
+      # the bundle. Only the bundle can answer that.
+      - name: List the bundle entries matching a substring
+        if: ${{ inputs.list_files != '' }}
+        env:
+          PATTERN: ${{ inputs.list_files }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, zipfile
+
+          pattern = os.environ["PATTERN"].lower()
+          with zipfile.ZipFile("downloaded_app/app.ipa") as ipa:
+              entries = [i for i in ipa.infolist() if pattern in i.filename.lower()]
+          print("===== bundle entries containing {!r}: {} =====".format(pattern, len(entries)))
+          # A directory of thousands would drown the log and say nothing that
+          # the count above does not.
+          for entry in entries[:200]:
+              print("{:>12}  {}".format(entry.file_size, entry.filename))
+          if len(entries) > 200:
+              print("... and {} more".format(len(entries) - 200))
           PY
 
       - name: Run the app under touchHLE
