@@ -1217,6 +1217,16 @@ impl Environment {
 
         let new_thread_id = self.threads.len() - 1;
 
+        // Which thread is which matters as soon as one of them stops making
+        // progress, and a thread number on its own says nothing. The address
+        // it starts at names it: pass that to
+        // dev-scripts/disassemble-guest.py and the app's own code says what
+        // the thread is for.
+        log!(
+            "Started guest thread {} at {:#x}",
+            new_thread_id,
+            start_routine.addr_without_thumb_bit(),
+        );
         log_dbg!("Created new thread {} with stack {:#x}–{:#x}, will execute function {:?} with data {:?}", new_thread_id, stack_alloc.to_bits(), (stack_high_addr - 1), start_routine, user_data);
 
         new_thread_id
