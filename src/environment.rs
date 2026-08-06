@@ -1165,6 +1165,60 @@ impl Environment {
         }
     }
 
+    /// The guest return addresses on a thread's stack, innermost first.
+    ///
+    /// The same frame-pointer walk as [Self::stack_trace_for_thread], but
+    /// returning the addresses instead of printing them, so a periodic sample
+    /// can carry a call stack. A single address says where a thread is; the
+    /// stack says what it is doing there, which is the difference between
+    /// "in a leaf predicate" and "in the loop that calls it".
+    fn stack_addresses_for_thread(&self, tid: ThreadId, limit: usize) -> Vec<u32> {
+        let mut frames = Vec::new();
+        if tid >= self.threads.len() {
+            return frames;
+        }
+        let Some(stack_range) = self.threads[tid].stack.clone() else {
+            return frames;
+        };
+        let (regs, _cpsr) = if self.current_thread == tid {
+            (*self.cpu.regs(), self.cpu.cpsr())
+        } else {
+            let Some(ctx) = self.threads[tid].guest_context.as_ref() else {
+                return frames;
+            };
+            (ctx.regs, ctx.cpsr)
+        };
+        frames.push(regs[cpu::Cpu::PC]);
+
+        let return_to_host = self.dyld.return_to_host_routine().addr_with_thumb_bit();
+        let thread_exit = self.dyld.thread_exit_routine().addr_with_thumb_bit();
+        let lr = regs[cpu::Cpu::LR];
+        if lr != return_to_host && lr != thread_exit {
+            frames.push(lr & !1);
+        }
+
+        let mut fp: mem::ConstPtr<u8> = mem::Ptr::from_bits(regs[abi::FRAME_POINTER]);
+        while frames.len() < limit {
+            if !stack_range.contains(&fp.to_bits()) {
+                break;
+            }
+            let lr: u32 = self.mem.read((fp + 4).cast());
+            let next: mem::ConstPtr<u8> = self.mem.read(fp.cast());
+            if lr == thread_exit {
+                break;
+            }
+            if lr != return_to_host {
+                frames.push(lr & !1);
+            }
+            // A frame pointer that does not move would spin here forever.
+            if next.to_bits() <= fp.to_bits() {
+                break;
+            }
+            fp = next;
+        }
+        frames
+    }
+
     /// Create a new thread and return its ID. The `start_routine` and
     /// `user_data` arguments have the same meaning as the last two arguments to
     /// `pthread_create`.
@@ -1544,13 +1598,27 @@ impl Environment {
             Some(name) => format!("{:#x} (host {})", pc, name),
             None => format!("{:#x}", pc),
         };
+        // The call stack of the thread that is actually running: a single
+        // address only says which leaf function a spin loop happened to be
+        // in, and the loop itself is one or two frames up.
+        let stack: Vec<String> = self
+            .stack_addresses_for_thread(self.current_thread, 12)
+            .iter()
+            .skip(1)
+            .map(|address| format!("{:#x}", address))
+            .collect();
         log!(
-            "guest sample at {:.0}s: thread {} at {}{}, {} MiB read from files",
+            "guest sample at {:.0}s: thread {} at {}{}, {} MiB read from files, called from {}",
             elapsed,
             self.current_thread,
             where_,
             others,
             crate::libc::posix_io::total_bytes_read() / (1024 * 1024),
+            if stack.is_empty() {
+                "(no frames)".to_string()
+            } else {
+                stack.join(" <- ")
+            },
         );
     }
 
