@@ -1540,7 +1540,19 @@ impl Environment {
                 ThreadBlock::NotBlocked => "ready".to_string(),
                 ThreadBlock::Sleeping(_) => "sleeping".to_string(),
                 ThreadBlock::Mutex(id) => format!("mutex {}", id),
-                ThreadBlock::Semaphore(ptr) => format!("semaphore {:?}", ptr),
+                // The count is the whole question for a semaphore: a thread
+                // parked on one at zero is waiting for a signal that has not
+                // come, and there is no other reason to be here.
+                ThreadBlock::Semaphore(ptr) => {
+                    let count = self
+                        .libc_state
+                        .semaphore
+                        .open_semaphores
+                        .get(ptr)
+                        .map(|sem| sem.borrow().value.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("semaphore {:?} (count {})", ptr, count)
+                }
                 // Which queue the thread is in decides what is wrong. In
                 // `waiting`, nobody has signalled it yet. In `waking`, a
                 // signal reached it and it is only held up by the mutex — so
@@ -1638,7 +1650,7 @@ impl Environment {
         // identical from a program counter, and quite different from here.
         let busiest: Vec<String> = self
             .dyld
-            .busiest_host_functions(6)
+            .busiest_host_functions(10)
             .into_iter()
             .map(|(symbol, count)| format!("{} x{}", symbol, count))
             .collect();
