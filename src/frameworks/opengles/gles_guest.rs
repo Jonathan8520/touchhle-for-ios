@@ -5182,6 +5182,14 @@ fn glProgramParameteri(env: &mut Environment, program: GLuint, pname: GLenum, va
 }
 
 unsafe fn clamp_fog_state_values(gles: &mut dyn GLES) -> Option<(f32, f32)> {
+    // Fog is fixed-function, so it does not exist on an ES2 context and
+    // `GL_FOG` is not a name such a driver accepts. Asking anyway raised
+    // GL_INVALID_ENUM before every single draw call, filling the error queue
+    // with errors the app did not cause — and an app that checks glGetError()
+    // after drawing then sees a failure that is not its own.
+    if gles.is_es2() {
+        return None;
+    }
     let mut fog_enabled: GLboolean = 0;
     gles.GetBooleanv(gles11::FOG, &mut fog_enabled);
     if fog_enabled != 0 {
