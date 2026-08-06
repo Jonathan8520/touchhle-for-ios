@@ -991,19 +991,248 @@ fn CCCrypt(
     kCCSuccess
 }
 
+// MARK: - Key derivation (CommonKeyDerivation.h)
+
+/// The hash functions CommonCrypto can build an HMAC on top of. Used both by
+/// [CCHmac] and by the PBKDF2 pseudo-random function.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum HmacHash {
+    Md5,
+    Sha1,
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl HmacHash {
+    fn digest_len(self) -> usize {
+        match self {
+            HmacHash::Md5 => 16,
+            HmacHash::Sha1 => 20,
+            HmacHash::Sha224 => 28,
+            HmacHash::Sha256 => 32,
+            HmacHash::Sha384 => 48,
+            HmacHash::Sha512 => 64,
+        }
+    }
+    /// The hash's internal block size, which is also the size HMAC pads the
+    /// key to. SHA-384 and SHA-512 use 1024-bit blocks, everything else 512.
+    fn block_size(self) -> usize {
+        match self {
+            HmacHash::Sha384 | HmacHash::Sha512 => 128,
+            _ => 64,
+        }
+    }
+    fn hash(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            HmacHash::Md5 => md5_hash(data).to_vec(),
+            HmacHash::Sha1 => <Sha1 as Sha2Digest>::digest(data).to_vec(),
+            HmacHash::Sha224 => <Sha224 as Sha2Digest>::digest(data).to_vec(),
+            HmacHash::Sha256 => <Sha256 as Sha2Digest>::digest(data).to_vec(),
+            HmacHash::Sha384 => <Sha384 as Sha2Digest>::digest(data).to_vec(),
+            HmacHash::Sha512 => <Sha512 as Sha2Digest>::digest(data).to_vec(),
+        }
+    }
+    /// `CCHmacAlgorithm` values, from CommonHMAC.h.
+    fn from_cc_hmac_algorithm(algorithm: u32) -> Option<Self> {
+        Some(match algorithm {
+            0 => HmacHash::Sha1,
+            1 => HmacHash::Md5,
+            2 => HmacHash::Sha256,
+            3 => HmacHash::Sha384,
+            4 => HmacHash::Sha512,
+            5 => HmacHash::Sha224,
+            _ => return None,
+        })
+    }
+    /// `CCPseudoRandomAlgorithm` values, from CommonKeyDerivation.h. Note that
+    /// these are *not* the same numbers as `CCHmacAlgorithm`, and that there is
+    /// no MD5 variant.
+    fn from_cc_prf_algorithm(prf: u32) -> Option<Self> {
+        Some(match prf {
+            1 => HmacHash::Sha1,
+            2 => HmacHash::Sha224,
+            3 => HmacHash::Sha256,
+            4 => HmacHash::Sha384,
+            5 => HmacHash::Sha512,
+            _ => return None,
+        })
+    }
+}
+
+/// HMAC with the key padding computed once, so PBKDF2 doesn't redo it on every
+/// one of its (often tens of thousands of) iterations.
+struct HmacKey {
+    hash: HmacHash,
+    k_ipad: Vec<u8>,
+    k_opad: Vec<u8>,
+}
+
+impl HmacKey {
+    fn new(hash: HmacHash, key: &[u8]) -> HmacKey {
+        let block_size = hash.block_size();
+        // RFC 2104: keys longer than the block size are replaced by their hash.
+        let key_block = if key.len() > block_size {
+            hash.hash(key)
+        } else {
+            key.to_vec()
+        };
+        let mut k_ipad = vec![0x36u8; block_size];
+        let mut k_opad = vec![0x5cu8; block_size];
+        for (i, &byte) in key_block.iter().enumerate() {
+            k_ipad[i] ^= byte;
+            k_opad[i] ^= byte;
+        }
+        HmacKey {
+            hash,
+            k_ipad,
+            k_opad,
+        }
+    }
+
+    fn mac(&self, data: &[u8]) -> Vec<u8> {
+        let mut inner = self.k_ipad.clone();
+        inner.extend_from_slice(data);
+        let inner_hash = self.hash.hash(&inner);
+        let mut outer = self.k_opad.clone();
+        outer.extend_from_slice(&inner_hash);
+        self.hash.hash(&outer)
+    }
+}
+
+/// PBKDF2 (RFC 2898 section 5.2).
+fn pbkdf2(hash: HmacHash, password: &[u8], salt: &[u8], rounds: u32, derived_key: &mut [u8]) {
+    let key = HmacKey::new(hash, password);
+    let hash_len = hash.digest_len();
+
+    let mut block_index: u32 = 1;
+    let mut offset = 0;
+    while offset < derived_key.len() {
+        let mut salt_and_index = salt.to_vec();
+        salt_and_index.extend_from_slice(&block_index.to_be_bytes());
+        let mut u = key.mac(&salt_and_index);
+        let mut t = u.clone();
+        for _ in 1..rounds {
+            u = key.mac(&u);
+            for (t_byte, &u_byte) in t.iter_mut().zip(u.iter()) {
+                *t_byte ^= u_byte;
+            }
+        }
+        let take = std::cmp::min(hash_len, derived_key.len() - offset);
+        derived_key[offset..offset + take].copy_from_slice(&t[..take]);
+        offset += take;
+        block_index += 1;
+    }
+}
+
+/// ```c
+/// int CCKeyDerivationPBKDF(CCPBKDFAlgorithm algorithm,
+///                          const char *password, size_t passwordLen,
+///                          const uint8_t *salt, size_t saltLen,
+///                          CCPseudoRandomAlgorithm prf, uint rounds,
+///                          uint8_t *derivedKey, size_t derivedKeyLen);
+/// ```
+///
+/// Note the two trailing output arguments: an implementation that stops at
+/// `rounds` never writes the key it was asked to derive, and a caller that
+/// checks only the return value will happily encrypt with whatever happened to
+/// be in the buffer. SQLCipher-backed apps derive their database key this way.
 #[allow(non_snake_case)]
+#[allow(clippy::too_many_arguments)]
 fn CCKeyDerivationPBKDF(
+    env: &mut Environment,
+    algorithm: u32,
+    password: ConstVoidPtr,
+    password_len: GuestUSize,
+    salt: ConstVoidPtr,
+    salt_len: GuestUSize,
+    prf: u32,
+    rounds: u32,
+    derived_key: MutVoidPtr,
+    derived_key_len: GuestUSize,
+) -> i32 {
+    const kCCPBKDF2: u32 = 2;
+
+    if algorithm != kCCPBKDF2 {
+        log!(
+            "CCKeyDerivationPBKDF: unsupported algorithm {}, returning kCCParamError",
+            algorithm
+        );
+        return kCCParamError;
+    }
+    let Some(hash) = HmacHash::from_cc_prf_algorithm(prf) else {
+        log!(
+            "CCKeyDerivationPBKDF: unsupported PRF {}, returning kCCParamError",
+            prf
+        );
+        return kCCParamError;
+    };
+    // Apple's implementation rejects these rather than looping zero times or
+    // writing nothing.
+    if rounds == 0 || derived_key_len == 0 || derived_key.is_null() {
+        log!(
+            "CCKeyDerivationPBKDF: rounds={} derivedKeyLen={} derivedKey={:?}, returning kCCParamError",
+            rounds,
+            derived_key_len,
+            derived_key
+        );
+        return kCCParamError;
+    }
+
+    let password_bytes = if password_len == 0 {
+        Vec::new()
+    } else {
+        env.mem.bytes_at(password.cast(), password_len).to_vec()
+    };
+    let salt_bytes = if salt_len == 0 {
+        Vec::new()
+    } else {
+        env.mem.bytes_at(salt.cast(), salt_len).to_vec()
+    };
+
+    let mut out = vec![0u8; derived_key_len as usize];
+    pbkdf2(hash, &password_bytes, &salt_bytes, rounds, &mut out);
+
+    env.mem
+        .bytes_at_mut(derived_key.cast(), derived_key_len)
+        .copy_from_slice(&out);
+
+    log!(
+        "CCKeyDerivationPBKDF(prf={:?}, rounds={}, passwordLen={}, saltLen={}) -> {} byte key",
+        hash,
+        rounds,
+        password_len,
+        salt_len,
+        derived_key_len
+    );
+    kCCSuccess
+}
+
+/// ```c
+/// uint CCCalibratePBKDF(CCPBKDFAlgorithm algorithm, size_t passwordLen,
+///                       size_t saltLen, CCPseudoRandomAlgorithm prf,
+///                       size_t derivedKeyLen, uint32_t msec);
+/// ```
+///
+/// Returns the number of rounds that would take roughly `msec` milliseconds.
+/// We don't actually benchmark: the answer feeds straight back into
+/// [CCKeyDerivationPBKDF], which we run on the host, so an honest calibration
+/// would ask us to burn real time for no benefit. The cap keeps a guest that
+/// asks for a large `msec` from stalling startup.
+#[allow(non_snake_case)]
+fn CCCalibratePBKDF(
     _env: &mut Environment,
     _algorithm: u32,
-    _password: ConstVoidPtr,
     _password_len: GuestUSize,
-    _salt: ConstVoidPtr,
     _salt_len: GuestUSize,
     _prf: u32,
-    _rounds: u32,
-) -> i32 {
-    log!("TODO: CCKeyDerivationPBKDF");
-    kCCSuccess
+    _derived_key_len: GuestUSize,
+    msec: u32,
+) -> u32 {
+    let rounds = (msec.saturating_mul(2000)).clamp(1000, 100_000);
+    log!("CCCalibratePBKDF(msec={}) -> {} rounds", msec, rounds);
+    rounds
 }
 
 // One-shot MD5 hash (host-side, no guest memory)
@@ -1230,68 +1459,36 @@ fn CCHmac(
     data_length: GuestUSize,
     mac_out: MutVoidPtr,
 ) {
-    // algorithm: 0=SHA1, 1=MD5, 2=SHA256, 3=SHA384, 4=SHA512, 5=SHA224
-    let (block_size, hash_len): (usize, usize) = match algorithm {
-        0 => (64, 20), // kCCHmacAlgSHA1
-        1 => (64, 16), // kCCHmacAlgMD5
-        2 => (64, 32), // kCCHmacAlgSHA256
-        _ => {
-            log!("CCHmac: unsupported algorithm {}, writing zeros", algorithm);
-            return;
-        }
+    // SHA-384/512 were previously rejected here, and the early return left the
+    // caller's buffer untouched rather than writing the zeros it promised.
+    let Some(hash) = HmacHash::from_cc_hmac_algorithm(algorithm) else {
+        log!(
+            "CCHmac: unsupported algorithm {}, leaving the output buffer alone",
+            algorithm
+        );
+        return;
     };
+    let hash_len = hash.digest_len();
 
     log!(
-        "CCHmac(algorithm={}, keyLen={}, dataLen={})",
-        algorithm,
+        "CCHmac(algorithm={:?}, keyLen={}, dataLen={})",
+        hash,
         key_length,
         data_length
     );
 
-    let key_bytes = env.mem.bytes_at(key.cast(), key_length).to_vec();
-    let data_bytes = env.mem.bytes_at(data.cast(), data_length).to_vec();
-
-    // If key is longer than block size, hash it first
-    let key_block = if key_bytes.len() > block_size {
-        match algorithm {
-            0 => sha1_hash(&key_bytes).to_vec(),
-            1 => md5_hash(&key_bytes).to_vec(),
-            2 => sha256_hash(&key_bytes).to_vec(),
-            _ => unreachable!(),
-        }
+    let key_bytes = if key_length == 0 {
+        Vec::new()
     } else {
-        key_bytes
+        env.mem.bytes_at(key.cast(), key_length).to_vec()
+    };
+    let data_bytes = if data_length == 0 {
+        Vec::new()
+    } else {
+        env.mem.bytes_at(data.cast(), data_length).to_vec()
     };
 
-    // Pad key to block_size
-    let mut k_ipad = vec![0x36u8; block_size];
-    let mut k_opad = vec![0x5cu8; block_size];
-    for i in 0..key_block.len() {
-        k_ipad[i] ^= key_block[i];
-        k_opad[i] ^= key_block[i];
-    }
-
-    // inner = H(k_ipad || data)
-    let mut inner_data = k_ipad;
-    inner_data.extend_from_slice(&data_bytes);
-
-    let inner_hash: Vec<u8> = match algorithm {
-        0 => sha1_hash(&inner_data).to_vec(),
-        1 => md5_hash(&inner_data).to_vec(),
-        2 => sha256_hash(&inner_data).to_vec(),
-        _ => unreachable!(),
-    };
-
-    // outer = H(k_opad || inner_hash)
-    let mut outer_data = k_opad;
-    outer_data.extend_from_slice(&inner_hash);
-
-    let result: Vec<u8> = match algorithm {
-        0 => sha1_hash(&outer_data).to_vec(),
-        1 => md5_hash(&outer_data).to_vec(),
-        2 => sha256_hash(&outer_data).to_vec(),
-        _ => unreachable!(),
-    };
+    let result = HmacKey::new(hash, &key_bytes).mac(&data_bytes);
 
     env.mem
         .bytes_at_mut(mac_out.cast(), hash_len as GuestUSize)
@@ -2075,7 +2272,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CCCryptorGetOutputLength(_, _, _)),
     export_c_func!(CCCryptorReset(_, _)),
     export_c_func!(CCCryptorRelease(_)),
-    export_c_func!(CCKeyDerivationPBKDF(_, _, _, _, _, _, _)),
+    export_c_func!(CCKeyDerivationPBKDF(_, _, _, _, _, _, _, _, _)),
+    export_c_func!(CCCalibratePBKDF(_, _, _, _, _, _)),
     export_c_func!(CCHmac(_, _, _, _, _, _)),
     export_c_func!(CC_MD5_Init(_)),         // Было (_, _), нужно (_)
     export_c_func!(CC_MD5_Update(_, _, _)), // Было (_, _, _, _), нужно (_, _, _)
@@ -2115,6 +2313,135 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     constant_exports: &[],
     function_exports: &[FUNCTIONS],
 };
+
+#[cfg(test)]
+mod kdf_tests {
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// RFC 2202 test vectors for HMAC-MD5 and HMAC-SHA-1.
+    #[test]
+    fn rfc_2202_hmac() {
+        assert_eq!(
+            hex(&HmacKey::new(HmacHash::Md5, &[0x0b; 16]).mac(b"Hi There")),
+            "9294727a3638bb1c13f48ef8158bfc9d"
+        );
+        assert_eq!(
+            hex(&HmacKey::new(HmacHash::Md5, b"Jefe").mac(b"what do ya want for nothing?")),
+            "750c783e6ab0b503eaa86e310a5db738"
+        );
+        assert_eq!(
+            hex(&HmacKey::new(HmacHash::Sha1, &[0x0b; 20]).mac(b"Hi There")),
+            "b617318655057264e28bc0b6fb378c8ef146be00"
+        );
+        // A key longer than the 64-byte block size, so it gets hashed first.
+        assert_eq!(
+            hex(&HmacKey::new(HmacHash::Sha1, &[0xaa; 80])
+                .mac(b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            "aa4ae5e15272d00e95705637ce8a3b55ed402112"
+        );
+    }
+
+    /// RFC 4231 test vector 4, which covers the 128-byte block size used by
+    /// SHA-384 and SHA-512 — the two algorithms `CCHmac` used to refuse.
+    #[test]
+    fn rfc_4231_hmac_sha2() {
+        let key: Vec<u8> = (1u8..=25).collect();
+        let data = [0xcdu8; 50];
+        assert_eq!(
+            hex(&HmacKey::new(HmacHash::Sha224, &key).mac(&data)),
+            "6c11506874013cac6a2abc1bb382627cec6a90d86efc012de7afec5a"
+        );
+        assert_eq!(
+            hex(&HmacKey::new(HmacHash::Sha256, &key).mac(&data)),
+            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"
+        );
+        assert_eq!(
+            hex(&HmacKey::new(HmacHash::Sha384, &key).mac(&data)),
+            "3e8a69b7783c25851933ab6290af6ca77a9981480850009cc5577c6e1f573b4e\
+             6801dd23c4a7d679ccf8a386c674cffb"
+        );
+        assert_eq!(
+            hex(&HmacKey::new(HmacHash::Sha512, &key).mac(&data)),
+            "b0ba465637458c6990e5a8c5f61d4af7e576d97ff94b872de76f8050361ee3db\
+             a91ca5c11aa25eb4d679275cc5788063a5f19741120c4f2de2adebeb10a298dd"
+        );
+    }
+
+    /// RFC 6070 test vectors for PBKDF2-HMAC-SHA-1.
+    #[test]
+    fn rfc_6070_pbkdf2_sha1() {
+        let mut out = [0u8; 20];
+        pbkdf2(HmacHash::Sha1, b"password", b"salt", 1, &mut out);
+        assert_eq!(hex(&out), "0c60c80f961f0e71f3a9b524af6012062fe037a6");
+
+        pbkdf2(HmacHash::Sha1, b"password", b"salt", 2, &mut out);
+        assert_eq!(hex(&out), "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957");
+
+        pbkdf2(HmacHash::Sha1, b"password", b"salt", 4096, &mut out);
+        assert_eq!(hex(&out), "4b007901b765489abead49d926f721d065a429c1");
+
+        // Derived key longer than one hash block, so multiple PBKDF2 blocks are
+        // concatenated — the case SQLCipher hits when it asks for a 32-byte key
+        // from a 20-byte PRF.
+        let mut out25 = [0u8; 25];
+        pbkdf2(
+            HmacHash::Sha1,
+            b"passwordPASSWORDpassword",
+            b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+            4096,
+            &mut out25,
+        );
+        assert_eq!(
+            hex(&out25),
+            "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038"
+        );
+
+        // Embedded NULs must not truncate either input.
+        let mut out16 = [0u8; 16];
+        pbkdf2(HmacHash::Sha1, b"pass\0word", b"sa\0lt", 4096, &mut out16);
+        assert_eq!(hex(&out16), "56fa6aa75548099dcc37d7f03425e0c3");
+    }
+
+    /// PBKDF2-HMAC-SHA-256, from RFC 7914 section 11.
+    #[test]
+    fn rfc_7914_pbkdf2_sha256() {
+        let mut out = [0u8; 64];
+        pbkdf2(HmacHash::Sha256, b"passwd", b"salt", 1, &mut out);
+        assert_eq!(
+            hex(&out),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc\
+             49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+        );
+    }
+
+    /// The 32-byte key size SQLCipher asks for is the one that used to come
+    /// back as whatever was already in the buffer.
+    #[test]
+    fn derived_key_is_actually_written() {
+        let mut out = [0xffu8; 32];
+        pbkdf2(
+            HmacHash::Sha1,
+            b"secret",
+            b"\x01\x02\x03\x04",
+            64000,
+            &mut out,
+        );
+        assert!(out.iter().any(|&b| b != 0xff));
+        let mut again = [0u8; 32];
+        pbkdf2(
+            HmacHash::Sha1,
+            b"secret",
+            b"\x01\x02\x03\x04",
+            64000,
+            &mut again,
+        );
+        assert_eq!(out, again, "PBKDF2 must be deterministic");
+    }
+}
 
 #[cfg(test)]
 mod des_tests {
