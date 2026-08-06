@@ -335,9 +335,14 @@ pub fn pthread_cond_destroy(env: &mut Environment, cond: MutPtr<pthread_cond_t>)
     0 // success
 }
 
-/// pthread_cond_timedwait_relative_np — Apple extension with a relative
-//timeout.
-/// Same stub approach as timedwait in the fork, effectively acting as wait.
+/// `pthread_cond_timedwait_relative_np` — Apple extension taking a timeout
+/// relative to now rather than an absolute deadline.
+///
+/// The deadline is carried to the nanosecond. Rounding it down to whole
+/// seconds, as this used to, put it in the past for every wait shorter than
+/// a second — which is every wait an app actually makes — so the call
+/// returned ETIMEDOUT immediately and a thread waiting on a condition
+/// variable turned into a busy loop.
 pub fn pthread_cond_timedwait_relative_np(
     env: &mut Environment,
     cond: MutPtr<pthread_cond_t>,
@@ -351,13 +356,13 @@ pub fn pthread_cond_timedwait_relative_np(
         Duration::from_secs(ts.tv_sec.max(0) as u64)
             .saturating_add(Duration::from_nanos(ts.tv_nsec.max(0) as u64))
     };
+    let deadline = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .saturating_add(duration);
     let abs_time = env.mem.alloc_and_write(timespec {
-        tv_sec: (SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .saturating_add(duration)
-            .as_secs()) as _,
-        tv_nsec: 0,
+        tv_sec: deadline.as_secs() as _,
+        tv_nsec: deadline.subsec_nanos() as _,
     });
     let result = pthread_cond_timedwait(env, cond, mutex, abs_time.cast_const());
     env.mem.free(abs_time.cast());

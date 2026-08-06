@@ -2378,7 +2378,18 @@ impl Environment {
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             self.relock_unblocked_mutex_for_thread(thread_id, mutex);
                             return thread_id;
-                        } else if let Some(deadline) = deadline {
+                        } else if deadline.is_some() && !host_cond.waking.contains(&thread_id) {
+                            let deadline = deadline.unwrap();
+                            // A thread in `waking` has already been handed a
+                            // signal: the signaller took it out of `waiting`
+                            // and will not signal again. Timing it out here
+                            // would throw that signal away — POSIX requires
+                            // the wait to succeed instead, precisely so a
+                            // wakeup cannot be lost this way — and both sides
+                            // of a handshake would then wait for each other
+                            // forever. Such a thread is only waiting for the
+                            // mutex now, so leave it alone; the branch above
+                            // releases it as soon as the mutex is free.
                             let time = SystemTime::now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
                                 .unwrap();
@@ -2391,12 +2402,6 @@ impl Environment {
                                 assert!(!host_cond.timed_out.contains(&thread_id));
                                 host_cond.timed_out.insert(thread_id);
 
-                                // FIX 1: Если тред уже был в очереди waking
-                                // (ему отправили
-                                // сигнал, но он ещё не успел захватить
-                                // мьютекс),
-                                // удаляем его оттуда вместо паники.
-                                host_cond.waking.retain(|&t| t != thread_id);
                                 host_cond.waiting.retain(|&t| t != thread_id);
 
                                 // FIX 2: Если мьютекс всё ещё занят другим
