@@ -31,15 +31,31 @@ tail -f run.log &
 TAIL_PID=$!
 
 # Poll once a second so we can notice an early exit instead of always waiting
-# the full duration.
+# the full duration. On the way, photograph the screen: a log can say the
+# render loop is alive and every frame can still be black, and only the pixels
+# settle that.
 elapsed=0
+next_shot=0
+shot=0
 while [ "$elapsed" -lt "$RUN_SECONDS" ]; do
     if ! kill -0 "$APP_PID" 2>/dev/null; then
         break
     fi
+    if [ -n "${DISPLAY:-}" ] && [ "$elapsed" -ge "$next_shot" ] && command -v import >/dev/null 2>&1; then
+        shot=$((shot + 1))
+        import -window root -silent "screenshot-${elapsed}s.png" 2>/dev/null || true
+        # Early, then spread out: an app draws its first frame long before its
+        # last, and both are worth having.
+        next_shot=$((elapsed + 10 + shot * 10))
+    fi
     sleep 1
     elapsed=$((elapsed + 1))
 done
+
+# One last look, before the app is stopped rather than after.
+if [ -n "${DISPLAY:-}" ] && command -v import >/dev/null 2>&1; then
+    import -window root -silent "screenshot-final.png" 2>/dev/null || true
+fi
 
 if kill -0 "$APP_PID" 2>/dev/null; then
     echo "Reached the ${RUN_SECONDS}s time limit; stopping the app."

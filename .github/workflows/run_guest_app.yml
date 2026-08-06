@@ -124,6 +124,7 @@ jobs:
             libgl1-mesa-dev \
             libegl1-mesa-dev \
             libgl1-mesa-dri \
+            imagemagick \
             xvfb
 
       - name: Cache Rust build artifacts
@@ -323,6 +324,38 @@ jobs:
           xvfb-run -a --server-args="-screen 0 640x960x24" \
             ./dev-scripts/ci-run-app.sh ./target/release/touchHLE \
             "${RUN_SECONDS}" downloaded_app/app.ipa ${EXTRA_ARGS}
+
+      # A log can say the render loop is alive while every frame it presents is
+      # black. Only the pixels settle that, so measure them.
+      - name: Describe what was on screen
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          shots=(screenshot-*.png)
+          if [ ${#shots[@]} -eq 0 ]; then
+            echo "no screenshots were taken"
+            exit 0
+          fi
+          echo "===== what was on screen ====="
+          for shot in "${shots[@]}"; do
+            # Mean brightness says whether anything was drawn at all; the
+            # number of distinct colours says whether it was a picture or a
+            # single flat fill.
+            mean=$(identify -format '%[fx:int(mean*255)]' "$shot" 2>/dev/null || echo '?')
+            sd=$(identify -format '%[fx:int(standard_deviation*255)]' "$shot" 2>/dev/null || echo '?')
+            colours=$(identify -format '%k' "$shot" 2>/dev/null || echo '?')
+            size=$(identify -format '%wx%h' "$shot" 2>/dev/null || echo '?')
+            echo "$shot: $size, mean brightness $mean/255, std dev $sd, $colours distinct colours"
+          done
+
+      - name: Upload the screenshots
+        if: ${{ always() }}
+        uses: actions/upload-artifact@main
+        with:
+          name: guest_app_screenshots
+          path: screenshot-*.png
+          if-no-files-found: ignore
 
       # An address in the log — the LR of an ignored UndefinedInstruction, say
       # — says nothing on its own. This shows the guest instructions around it.
