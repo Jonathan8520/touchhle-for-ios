@@ -316,12 +316,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     ns_string::get_static_str(env, "NSMACHOperatingSystem")
 }
 
-- (id)operatingSystemVersionString {
-    assert_process_info_singleton(env, this); // TODO
-    // Human-readable only. Puzzle Agent uses this together with
-    // operatingSystemName while collecting platform diagnostics.
-    ns_string::get_static_str(env, "Version 3.1.3 (Build 7E18)")
-}
+// A second -operatingSystemVersionString used to sit here, answering
+// "Version 3.1.3 (Build 7E18)" while the one above answers with this
+// module's own OS_VERSION_* constants. Two implementations of one selector
+// on one class means whichever the class table happened to keep is the one
+// a guest reached. The remaining one at least agrees with
+// -operatingSystemVersion, which the same object reports.
+//
+// (UIDevice's -systemVersion answers "6.1", which agrees with neither. That
+// is a separate question from this duplicate, and not one to settle blind.)
 
 @end
 
