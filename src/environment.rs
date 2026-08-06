@@ -1611,8 +1611,12 @@ impl Environment {
         // identifiable, and the last file it reached for names the subsystem
         // far more directly than a guest address does.
         let (opened, failed_to_open, last_path) = crate::fs::open_summary();
+        // An app stuck inside its own allocator has either exhausted the
+        // address space or is refusing memory it could still have, and those
+        // want opposite fixes.
+        let (allocations, allocated_bytes) = self.mem.allocated();
         log!(
-            "guest sample at {:.0}s: thread {} at {}{}, {} KiB read from {} files ({} not found, last: {:?}), called from {}",
+            "guest sample at {:.0}s: thread {} at {}{}, {} KiB read from {} files ({} not found, last: {:?}), {} KiB of guest memory in {} allocations, called from {}",
             elapsed,
             self.current_thread,
             where_,
@@ -1621,6 +1625,8 @@ impl Environment {
             opened,
             failed_to_open,
             last_path,
+            allocated_bytes / 1024,
+            allocations,
             if stack.is_empty() {
                 "(no frames)".to_string()
             } else {

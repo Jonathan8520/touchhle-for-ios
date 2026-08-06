@@ -868,6 +868,12 @@ impl Mem {
             .copy_within(src_addr..src_addr + size_us, dest_addr)
     }
 
+    /// How much of the guest's address space is handed out, as
+    /// `(number of allocations, bytes)`.
+    pub fn allocated(&self) -> (u64, u64) {
+        self.allocator.allocated()
+    }
+
     /// Allocate `size` bytes.
     pub fn alloc(&mut self, size: GuestUSize) -> MutVoidPtr {
         let ptr = Ptr::from_bits(self.allocator.alloc(size));

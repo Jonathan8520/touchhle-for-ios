@@ -131,6 +131,13 @@ mod collections {
         pub fn get_size_with_base(&self, base: VAddr) -> Option<NonZeroU32> {
             self.chunks.get(&base).copied()
         }
+        /// `(number of chunks, bytes they cover)`.
+        pub fn totals(&self) -> (u64, u64) {
+            (
+                self.chunks.len() as u64,
+                self.chunks.values().map(|size| size.get() as u64).sum(),
+            )
+        }
     }
 
     #[derive(Default, Debug)]
@@ -285,6 +292,16 @@ impl Allocator {
             used_chunks,
             unused_chunks,
         }
+    }
+
+    /// How much of the guest's address space is handed out, as
+    /// `(number of allocations, bytes)`.
+    ///
+    /// A guest that has stopped making progress inside its own allocator has
+    /// either exhausted the address space or is refusing memory it could
+    /// still have, and those want opposite fixes. This says which.
+    pub fn allocated(&self) -> (u64, u64) {
+        self.used_chunks.totals()
     }
 
     pub fn reserve(&mut self, chunk: Chunk) {
