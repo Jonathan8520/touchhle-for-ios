@@ -274,6 +274,27 @@ def section_for(data, address):
     return None
 
 
+def stub_for(data, address):
+    """The import a symbol stub stands for, as `(entry address, name)`.
+
+    A call to an imported function branches into a stub section rather than
+    into the function itself, and an address sampled from a running app
+    lands wherever in the entry the app happened to be. Round down to the
+    entry it belongs to and resolve that. Returns None for an address
+    outside a stub section."""
+    section = section_for(data, address)
+    if section is None or section["type"] != S_SYMBOL_STUBS:
+        return None
+    stride = section["reserved2"]
+    if not stride:
+        return None
+    start = section["addr"] + (address - section["addr"]) // stride * stride
+    entry = tables(data)["indirect"].get(start)
+    if entry is None:
+        return None
+    return start, entry[0]
+
+
 def symbol_for(data, address):
     """The best name for `address`: an import slot, an exact symbol, or a
     symbol plus an offset."""
@@ -1256,6 +1277,20 @@ def main(argv):
         # describing, so it must not be turned away here.
         if file_offset(data, address) is None and not is_zerofill(data, address):
             print("not inside any mapped segment")
+            continue
+        # A stub is four instructions that load a pointer and branch
+        # through it. Which import it stands for is the whole of what the
+        # address means; disassembling it would print the same four
+        # instructions the neighbouring entries have.
+        stub = stub_for(data, address)
+        if stub is not None:
+            entry, name = stub
+            print(
+                "symbol stub for {}{}".format(
+                    name,
+                    "" if entry == address else " (entry at {:#x})".format(entry),
+                )
+            )
             continue
         # In code, the useful thing is which function this is inside. In
         # data it is what the word there holds — printing that for code
