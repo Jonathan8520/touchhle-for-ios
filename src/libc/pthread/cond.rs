@@ -124,6 +124,7 @@ pub fn pthread_cond_timedwait(
     mutex: MutPtr<pthread_mutex_t>,
     abs_time: ConstPtr<timespec>,
 ) -> i32 {
+    report_cond_use(env, "waited on with a timeout", cond);
     let time = env.mem.read(abs_time);
     // Per POSIX, tv_sec and tv_nsec are signed but negative values are invalid.
     // Real iOS clamps them to 0 rather than crashing. Some games (e.g. Unity
@@ -189,6 +190,7 @@ pub fn pthread_cond_wait(
     cond: MutPtr<pthread_cond_t>,
     mutex: MutPtr<pthread_mutex_t>,
 ) -> i32 {
+    report_cond_use(env, "waited on", cond);
     if let Err(e) = check_or_register_cond(env, cond) {
         return e;
     }
@@ -235,7 +237,48 @@ pub fn pthread_cond_wait(
     0 // success
 }
 
+/// Report the guest code on either side of a condition variable, the first
+/// few times it is used.
+///
+/// A condition variable that nobody signals stops an app dead, and the two
+/// halves of the problem — who waits and who is supposed to wake them — are
+/// both guest code, so the emulator's log otherwise shows neither. The
+/// address is the caller's return address, which
+/// `dev-scripts/disassemble-guest.py` turns back into the app's own code.
+fn report_cond_use(env: &Environment, what: &str, cond: MutPtr<pthread_cond_t>) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    const PER_SITE_LIMIT: usize = 3;
+    static SEEN: OnceLock<Mutex<HashMap<(String, u32, u32), usize>>> = OnceLock::new();
+
+    let caller = env.cpu.regs()[crate::cpu::Cpu::LR];
+    let key = (what.to_string(), cond.to_bits(), caller);
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let count = {
+        let mut map = seen.lock().unwrap();
+        let entry = map.entry(key).or_insert(0);
+        *entry += 1;
+        *entry
+    };
+    if count <= PER_SITE_LIMIT {
+        log!(
+            "condition variable {:?}: {} by thread {}, called from {:#x}{}",
+            cond,
+            what,
+            env.current_thread,
+            caller & !1,
+            if count == PER_SITE_LIMIT {
+                " (further uses from here will not be reported)"
+            } else {
+                ""
+            },
+        );
+    }
+}
+
 pub fn pthread_cond_signal(env: &mut Environment, cond: MutPtr<pthread_cond_t>) -> i32 {
+    report_cond_use(env, "signalled", cond);
     if let Err(e) = check_or_register_cond(env, cond) {
         return e;
     }
@@ -263,6 +306,7 @@ pub fn pthread_cond_signal(env: &mut Environment, cond: MutPtr<pthread_cond_t>) 
 }
 
 pub fn pthread_cond_broadcast(env: &mut Environment, cond: MutPtr<pthread_cond_t>) -> i32 {
+    report_cond_use(env, "broadcast", cond);
     if let Err(e) = check_or_register_cond(env, cond) {
         return e;
     }
