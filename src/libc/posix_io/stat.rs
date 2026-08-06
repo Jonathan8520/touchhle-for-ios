@@ -220,24 +220,16 @@ fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
         }
     };
 
-    let resolved_path = if !path_str.starts_with('/') && !env.fs.exists(GuestPath::new(&path_str)) {
-        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
-        let relative = path_str.strip_prefix("Data/").unwrap_or(&path_str);
-        let relative = relative.strip_prefix("Data/").unwrap_or(relative);
-        let candidate = format!("{bundle_root}/Data/{relative}");
-        if env.fs.exists(GuestPath::new(&candidate)) {
-            candidate
-        } else {
-            path_str.clone()
-        }
-    } else {
-        path_str.clone()
-    };
-    let guest_path = GuestPath::new(&resolved_path);
-    if !env.fs.exists(guest_path) {
+    // This has to search exactly where open() searches. It used to look only
+    // in the bundle's Data directory, so a game that asked how big a file was
+    // before reading it was told the file did not exist, while open() on the
+    // same path handed it the real one from the bundle root.
+    let resolved_path = crate::libc::posix_io::resolve_existing_path(env, &path_str);
+    let Some(resolved_path) = resolved_path else {
         set_errno(env, ENOENT);
         return -1;
-    }
+    };
+    let guest_path = GuestPath::new(&resolved_path);
 
     let mut st = stat::default();
 

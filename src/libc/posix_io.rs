@@ -193,6 +193,77 @@ struct iovec {
 }
 unsafe impl SafeRead for iovec {}
 
+/// The same path, spelled the way the guest filesystem spells it, if some
+/// spelling of it exists there.
+///
+/// A `.ipa` built on a case-insensitive filesystem routinely disagrees with
+/// itself about capitalisation, so an app can ask for `Foo.PNG` and mean the
+/// `foo.png` that is really in the bundle. Walk the path a component at a
+/// time, matching case-insensitively, and return the real spelling.
+pub fn case_insensitive_path(env: &Environment, path: &str) -> Option<String> {
+    if env.fs.exists(GuestPath::new(path)) {
+        return Some(path.to_string());
+    }
+
+    let is_absolute = path.starts_with('/');
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let mut current_path = if is_absolute {
+        String::from("/")
+    } else {
+        String::new()
+    };
+
+    for part in parts {
+        let parent_to_search = if current_path.is_empty() {
+            ".".to_string()
+        } else {
+            current_path.clone()
+        };
+        let target_lower = part.to_lowercase();
+        let found = {
+            let mut entries = env.fs.enumerate(GuestPath::new(&parent_to_search)).ok()?;
+            entries
+                .find(|entry| entry.to_lowercase() == target_lower)
+                .map(str::to_string)?
+        };
+
+        if !current_path.is_empty() && !current_path.ends_with('/') {
+            current_path.push('/');
+        }
+        current_path.push_str(&found);
+    }
+
+    if env.fs.exists(GuestPath::new(&current_path)) {
+        Some(current_path)
+    } else {
+        None
+    }
+}
+
+/// Where an existing file the guest named actually lives, if anywhere.
+///
+/// A relative path is the interesting case. On a device an app's own files
+/// are reached relative to its bundle, so a game that asks for
+/// `shared/assets/1a2b` means the one in its bundle. Try the path as given
+/// first, then inside the bundle, then inside the bundle's `Data` directory,
+/// which is where a Unity-style layout keeps them.
+///
+/// Every call that takes a path from the guest and looks something up must
+/// use this, not just `open`. When `stat` searched fewer places than `open`,
+/// a game could open a file and be told by `stat` that the same file did not
+/// exist — and a game that asks how big a file is before reading it got a
+/// missing file where `open` would have handed it the real one.
+pub fn resolve_existing_path(env: &Environment, path: &str) -> Option<String> {
+    if let Some(resolved) = case_insensitive_path(env, path) {
+        return Some(resolved);
+    }
+    let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+    let relative_path = path.trim_start_matches("./");
+    let data_relative_path = relative_path.strip_prefix("Data/").unwrap_or(relative_path);
+    case_insensitive_path(env, &format!("{bundle_root}/{relative_path}"))
+        .or_else(|| case_insensitive_path(env, &format!("{bundle_root}/Data/{data_relative_path}")))
+}
+
 fn open(env: &mut Environment, path: ConstPtr<u8>, flags: i32, _args: DotDotDot) -> FileDescriptor {
     set_errno(env, 0);
     self::open_direct(env, path, flags)
@@ -285,61 +356,14 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         log!("Ignoring O_NOFOLLOW when opening {:?}", path_string);
     }
 
-    fn case_insensitive_path(env: &Environment, path: &str) -> Option<String> {
-        if env.fs.exists(GuestPath::new(path)) {
-            return Some(path.to_string());
-        }
-
-        let is_absolute = path.starts_with('/');
-        let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-        let mut current_path = if is_absolute {
-            String::from("/")
-        } else {
-            String::new()
-        };
-
-        for part in parts {
-            let parent_to_search = if current_path.is_empty() {
-                ".".to_string()
-            } else {
-                current_path.clone()
-            };
-            let target_lower = part.to_lowercase();
-            let found = {
-                let mut entries = env.fs.enumerate(GuestPath::new(&parent_to_search)).ok()?;
-                entries
-                    .find(|entry| entry.to_lowercase() == target_lower)
-                    .map(str::to_string)?
-            };
-
-            if !current_path.is_empty() && !current_path.ends_with('/') {
-                current_path.push('/');
-            }
-            current_path.push_str(&found);
-        }
-
-        if env.fs.exists(GuestPath::new(&current_path)) {
-            Some(current_path)
-        } else {
-            None
-        }
-    }
-
-    let actual_path_string = case_insensitive_path(env, &path_string)
-        .or_else(|| {
-            if (flags & O_CREAT) != 0 {
-                return None;
-            }
-
-            let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
-            let relative_path = path_string.trim_start_matches("./");
-            let data_relative_path = relative_path.strip_prefix("Data/").unwrap_or(relative_path);
-            let bundle_relative_path = format!("{bundle_root}/{relative_path}");
-            let bundle_data_path = format!("{bundle_root}/Data/{data_relative_path}");
-            case_insensitive_path(env, &bundle_relative_path)
-                .or_else(|| case_insensitive_path(env, &bundle_data_path))
-        })
-        .unwrap_or_else(|| path_string.clone());
+    let actual_path_string = if (flags & O_CREAT) != 0 {
+        // A path being created does not exist yet, so the searches below have
+        // nothing to find, and letting one of them "resolve" the path would
+        // create the file somewhere the app did not ask for.
+        case_insensitive_path(env, &path_string).unwrap_or_else(|| path_string.clone())
+    } else {
+        resolve_existing_path(env, &path_string).unwrap_or_else(|| path_string.clone())
+    };
 
     // ИСПРАВЛЕНИЕ 2: корректная реализация O_EXCL.
     // O_CREAT|O_EXCL означает «создать файл, но вернуть ошибку, если он уже
