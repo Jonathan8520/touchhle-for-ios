@@ -69,6 +69,11 @@ on:
         type: string
         required: false
         default: ""
+      cat_file:
+        description: Path inside the bundle of a small text file to print, e.g. subheaps.xml
+        type: string
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -276,6 +281,36 @@ jobs:
                       print("{:>12}  {:>6} entries  {}".format(size, subtrees[name], name))
                   continue
               show([i for i in entries if pattern in i.filename.lower()], repr(pattern))
+          PY
+
+      # A configuration file the app reads decides what the app then does.
+      # When it has stopped somewhere, what that file told it is part of the
+      # question, and it is not visible from the outside.
+      - name: Print a text file from the bundle
+        if: ${{ inputs.cat_file != '' }}
+        env:
+          CAT_FILE: ${{ inputs.cat_file }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, zipfile
+
+          wanted = os.environ["CAT_FILE"].lower().lstrip("/")
+          with zipfile.ZipFile("downloaded_app/app.ipa") as ipa:
+              names = [n for n in ipa.namelist() if n.lower().endswith(wanted)]
+              if not names:
+                  print("no bundle entry ends with {!r}".format(wanted))
+              for name in names[:4]:
+                  data = ipa.read(name)
+                  print("===== {} ({} bytes) =====".format(name, len(data)))
+                  # Printing a binary would fill the log with noise, and a
+                  # large text file would too.
+                  if len(data) > 64 * 1024:
+                      print("(too large to print: {} bytes)".format(len(data)))
+                  elif b"\0" in data:
+                      print("(not text: contains NUL bytes)")
+                  else:
+                      print(data.decode("utf-8", "replace"))
           PY
 
       - name: Run the app under touchHLE
