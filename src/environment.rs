@@ -1487,7 +1487,50 @@ impl Environment {
                 ThreadBlock::Sleeping(_) => "sleeping".to_string(),
                 ThreadBlock::Mutex(id) => format!("mutex {}", id),
                 ThreadBlock::Semaphore(ptr) => format!("semaphore {:?}", ptr),
-                ThreadBlock::Condition(ptr, _) => format!("condition {:?}", ptr),
+                // Which queue the thread is in decides what is wrong. In
+                // `waiting`, nobody has signalled it yet. In `waking`, a
+                // signal reached it and it is only held up by the mutex — so
+                // say who holds that. In neither, its condition variable was
+                // re-initialised underneath it and no signal can ever reach
+                // it again.
+                ThreadBlock::Condition(ptr, deadline) => {
+                    let host_cond = self.libc_state.pthread.cond.condition_variables.get(ptr);
+                    let queue = match host_cond {
+                        None => "no longer registered".to_string(),
+                        Some(host_cond) => {
+                            if host_cond.waiting.contains(&tid) {
+                                "in the waiting queue".to_string()
+                            } else if let Some(place) =
+                                host_cond.waking.iter().position(|&t| t == tid)
+                            {
+                                let held_by = host_cond.curr_mutex.and_then(|mutex| {
+                                    (0..self.threads.len())
+                                        .find(|&t| self.mutex_state.mutex_is_locked_by(mutex, t))
+                                });
+                                format!(
+                                    "signalled, {} in the waking queue, mutex {}",
+                                    place,
+                                    match held_by {
+                                        Some(t) => format!("held by thread {}", t),
+                                        None => "free".to_string(),
+                                    },
+                                )
+                            } else {
+                                "IN NEITHER QUEUE — unreachable by any signal".to_string()
+                            }
+                        }
+                    };
+                    format!(
+                        "condition {:?} ({}{})",
+                        ptr,
+                        queue,
+                        if deadline.is_some() {
+                            ", with a deadline"
+                        } else {
+                            ", no deadline"
+                        },
+                    )
+                }
                 ThreadBlock::Joining(other, _) => format!("joining thread {}", other),
                 ThreadBlock::WaitingForDebugger(_) => "the debugger".to_string(),
                 ThreadBlock::Suspended(count, _) => format!("suspended x{}", count),
@@ -2353,7 +2396,12 @@ impl Environment {
                                 host_sem.value
                             );
                             host_sem.value -= 1;
-                            host_sem.waiting.remove(&self.current_thread);
+                            // The thread being released is `thread_id`, not
+                            // whichever one happened to be running when the
+                            // scheduler was entered. Removing the wrong one
+                            // left this thread listed as a waiter forever and
+                            // took a genuine waiter off the list.
+                            host_sem.waiting.remove(&thread_id);
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
                         }

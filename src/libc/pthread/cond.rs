@@ -81,7 +81,23 @@ pub fn pthread_cond_init(
     // мы не крашим эмулятор, а просто логируем предупреждение и штатно заменяем
     // объект,
     // как это сделала бы настоящая iOS.
-    if State::get(env).condition_variables.contains_key(&cond) {
+    // Re-initialising a condition variable that still has threads parked on
+    // it used to replace the host object with an empty one. Those threads are
+    // then in neither queue: no signal or broadcast can ever reach them, and
+    // without a deadline nothing times them out either, so they wait for the
+    // rest of the run in complete silence. Keep what is there.
+    if let Some(existing) = State::get(env).condition_variables.get(&cond) {
+        let parked = existing.waiting.len() + existing.waking.len();
+        if parked != 0 {
+            log!(
+                "Warning: pthread_cond_init on {:?}, which still has {} thread(s) waiting on it. \
+                 Keeping them: replacing the condition variable would leave them unreachable by \
+                 any later signal.",
+                cond,
+                parked,
+            );
+            return 0;
+        }
         log_dbg!(
             "Warning: pthread_cond_init called on already initialized condition variable {:?}",
             cond
@@ -124,6 +140,10 @@ pub fn pthread_cond_timedwait(
     mutex: MutPtr<pthread_mutex_t>,
     abs_time: ConstPtr<timespec>,
 ) -> i32 {
+    if let Err(e) = check_or_register_cond(env, cond) {
+        report_rejected(env, "pthread_cond_timedwait", cond, e);
+        return e;
+    }
     report_cond_use(env, "waited on with a timeout", cond);
     let time = env.mem.read(abs_time);
     // Per POSIX, tv_sec and tv_nsec are signed but negative values are invalid.
@@ -143,7 +163,7 @@ pub fn pthread_cond_timedwait(
     // мы не паникуем, а возвращаем ошибку обратно в игру, как делает реальная
     // ОС.
     if res != 0 {
-        log_dbg!("Warning: pthread_cond_timedwait called with unlocked/invalid mutex, returning error {}", res);
+        report_did_not_wait(env, "pthread_cond_timedwait", cond, res);
         return res;
     }
 
@@ -190,17 +210,15 @@ pub fn pthread_cond_wait(
     cond: MutPtr<pthread_cond_t>,
     mutex: MutPtr<pthread_mutex_t>,
 ) -> i32 {
-    report_cond_use(env, "waited on", cond);
     if let Err(e) = check_or_register_cond(env, cond) {
+        report_rejected(env, "pthread_cond_wait", cond, e);
         return e;
     }
+    report_cond_use(env, "waited on", cond);
     let res = pthread_mutex_unlock(env, mutex);
     // ЧЕСТНЫЙ ФИКС: Аналогичная обработка для обычного wait без таймаута
     if res != 0 {
-        log_dbg!(
-            "Warning: pthread_cond_wait called with unlocked/invalid mutex, returning error {}",
-            res
-        );
+        report_did_not_wait(env, "pthread_cond_wait", cond, res);
         return res;
     }
 
@@ -235,6 +253,62 @@ pub fn pthread_cond_wait(
 
     assert!(!host_object.timed_out.contains(&current_thread));
     0 // success
+}
+
+/// Report a condition-variable call that returned an error without waiting or
+/// signalling.
+///
+/// A guest `while (!ready) pthread_cond_wait(...)` loop around a call that
+/// returns immediately spins at full speed and looks exactly like a thread
+/// patiently waiting. These were logged at debug level only, so a run that
+/// never waits at all was indistinguishable from one that does.
+fn report_rejected(env: &Environment, what: &str, cond: MutPtr<pthread_cond_t>, err: i32) {
+    report_no_op(env, what, cond, err, "it is not a condition variable");
+}
+
+fn report_did_not_wait(env: &Environment, what: &str, cond: MutPtr<pthread_cond_t>, err: i32) {
+    report_no_op(
+        env,
+        what,
+        cond,
+        err,
+        "the mutex was not locked by this thread",
+    );
+}
+
+fn report_no_op(env: &Environment, what: &str, cond: MutPtr<pthread_cond_t>, err: i32, why: &str) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    const PER_SITE_LIMIT: usize = 3;
+    static SEEN: OnceLock<Mutex<HashMap<(String, u32, u32), usize>>> = OnceLock::new();
+
+    let caller = env.cpu.regs()[crate::cpu::Cpu::LR];
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let count = {
+        let mut map = seen.lock().unwrap();
+        let entry = map
+            .entry((what.to_string(), cond.to_bits(), caller))
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    };
+    if count <= PER_SITE_LIMIT {
+        log!(
+            "Warning: {}({:?}) from {:#x} returned {} without waiting or signalling, because {}. \
+             A guest loop around this call spins instead of waiting.{}",
+            what,
+            cond,
+            caller & !1,
+            err,
+            why,
+            if count == PER_SITE_LIMIT {
+                " (further occurrences here will not be reported)"
+            } else {
+                ""
+            },
+        );
+    }
 }
 
 /// Report the guest code on either side of a condition variable, the first
@@ -278,10 +352,11 @@ fn report_cond_use(env: &Environment, what: &str, cond: MutPtr<pthread_cond_t>) 
 }
 
 pub fn pthread_cond_signal(env: &mut Environment, cond: MutPtr<pthread_cond_t>) -> i32 {
-    report_cond_use(env, "signalled", cond);
     if let Err(e) = check_or_register_cond(env, cond) {
+        report_rejected(env, "pthread_cond_signal", cond, e);
         return e;
     }
+    report_cond_use(env, "signalled", cond);
     let host_object = State::get_mut(env)
         .condition_variables
         .get_mut(&cond)
@@ -306,10 +381,11 @@ pub fn pthread_cond_signal(env: &mut Environment, cond: MutPtr<pthread_cond_t>) 
 }
 
 pub fn pthread_cond_broadcast(env: &mut Environment, cond: MutPtr<pthread_cond_t>) -> i32 {
-    report_cond_use(env, "broadcast", cond);
     if let Err(e) = check_or_register_cond(env, cond) {
+        report_rejected(env, "pthread_cond_broadcast", cond, e);
         return e;
     }
+    report_cond_use(env, "broadcast", cond);
     log_dbg!(
         "Thread {} unblocks all threads waiting on condition variable {:?}",
         env.current_thread,
