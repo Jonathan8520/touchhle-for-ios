@@ -126,8 +126,40 @@ fn SCNetworkReachabilityGetFlags(
     _target: SCNetworkReachabilityRef,
     flags: MutPtr<SCNetworkReachabilityFlags>,
 ) -> bool {
-    // Принудительно говорим игре, что сеть доступна (Reachable)
-    env.mem.write(flags, kSCNetworkReachabilityFlagsReachable);
+    // touchHLE has no network stack: every NSURLConnection and NSURLSession
+    // request is failed with NSURLErrorNotConnectedToInternet. Telling an app
+    // the network is reachable and then failing everything it sends is a story
+    // that does not add up, and an app that believes the first half takes its
+    // online path and waits for a reply that will never arrive. Disney
+    // Infinity waits on "Connecting… Please Wait" for as long as it is left
+    // running.
+    //
+    // Saying the network is unreachable is both true and what sends such an
+    // app down the offline path it already has. `--claim-network-reachable`
+    // restores the old answer for an app that will not start without it.
+    let reachable = env.options.claim_network_reachable;
+    if reachable {
+        log_once!(
+            "SCNetworkReachabilityGetFlags: reporting the network as reachable \
+             because --claim-network-reachable was given, though touchHLE has \
+             no network stack [this log will only be shown once]"
+        );
+    } else {
+        log_once!(
+            "SCNetworkReachabilityGetFlags: reporting the network as \
+             unreachable, because touchHLE has no network stack. Pass \
+             --claim-network-reachable to say otherwise [this log will only \
+             be shown once]"
+        );
+    }
+    env.mem.write(
+        flags,
+        if reachable {
+            kSCNetworkReachabilityFlagsReachable
+        } else {
+            0
+        },
+    );
     true
 }
 

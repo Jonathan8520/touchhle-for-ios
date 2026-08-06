@@ -111,6 +111,18 @@ pub struct Options {
     /// `glGetError()` clears the error queue, so guest `glGetError()` calls
     /// will see 0 instead of the real error. Diagnostic only.
     pub trace_gl_errors: bool,
+    /// Whether `SCNetworkReachability` should tell the app the network is
+    /// available.
+    ///
+    /// touchHLE has no network stack: every `NSURLConnection` and
+    /// `NSURLSession` request is failed with `NSURLErrorNotConnectedToInternet`.
+    /// Reporting the network as reachable anyway tells an app to take its
+    /// online path, and an app that then waits for a reply it will never get
+    /// waits forever — Disney Infinity sits on "Connecting… Please Wait".
+    /// Saying it is unreachable is both true and what sends such an app down
+    /// its offline path, so that is the default; this exists for an app that
+    /// refuses to start without it.
+    pub claim_network_reachable: bool,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
     /// `GL_NEAREST_MIPMAP_LINEAR` (which makes the texture incomplete
@@ -183,6 +195,7 @@ impl Default for Options {
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
             trace_gl_errors: false,
+            claim_network_reachable: false,
             fix_texture_min_filter: false,
             zero_stack_after_guest_to_host_call: None,
             trace_objc: Vec::new(),
@@ -389,6 +402,8 @@ impl Options {
             self.ignore_gl_errors = true;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
+        } else if arg == "--claim-network-reachable" {
+            self.claim_network_reachable = true;
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
         } else if let Some(value) = arg.strip_prefix("--trace-objc=") {

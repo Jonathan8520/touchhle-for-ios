@@ -353,6 +353,20 @@ Other options:
         and adds a glGetError() round-trip per call, so it should not be
         left on for normal use.
 
+    --claim-network-reachable
+        Tell the app SCNetworkReachability reports the network as available.
+
+        touchHLE has no network stack: every NSURLConnection and
+        NSURLSession request is failed with NSURLErrorNotConnectedToInternet.
+        By default reachability says so too, which sends an app down the
+        offline path it already has. Claiming the network is reachable and
+        then failing everything the app sends is a story that does not add
+        up, and an app that believes the first half can wait forever for a
+        reply that never comes.
+
+        This option exists for an app that refuses to start without a
+        network. It does not provide one.
+
     --trace-objc=<substring>[,<substring>…]
         For diagnostic builds. Log every Objective-C message whose
         receiver's class name or whose selector contains one of the given
