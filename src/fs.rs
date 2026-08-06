@@ -48,6 +48,8 @@ enum FileLocation {
     IpaFileRef(IpaFileRef),
     /// Name of a resource file bundled with touchHLE. Read only.
     ResourceFilePath(String),
+    /// `/dev/random` or `/dev/urandom`: an endless supply of random bytes.
+    RandomDevice,
 }
 
 #[derive(Debug)]
@@ -146,6 +148,16 @@ impl FsNode {
     fn resource_file(name: String) -> Self {
         FsNode::File {
             location: FileLocation::ResourceFilePath(name),
+            writeable: false,
+        }
+    }
+    fn random_device() -> Self {
+        FsNode::File {
+            location: FileLocation::RandomDevice,
+            // Not writeable in the sense the rest of this file means it —
+            // there is no host file behind it to overwrite. Writes to the
+            // open device are accepted and discarded, as they are on a real
+            // system.
             writeable: false,
         }
     }
@@ -425,6 +437,35 @@ fn handle_open_err<T, E: std::fmt::Display, P: std::fmt::Debug>(
     }
 }
 
+/// Fill `buf` with bytes from `/dev/urandom`.
+///
+/// The same xorshift the libc `arc4random` family uses, seeded once from the
+/// clock. This is not a cryptographic generator and nothing here pretends
+/// otherwise; what callers of `/dev/urandom` need from touchHLE is bytes that
+/// differ from run to run and from each other, which a real device gives them
+/// and an absent `/dev/urandom` gives them not at all.
+fn fill_with_random_bytes(buf: &mut [u8]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static STATE: AtomicU32 = AtomicU32::new(0);
+
+    let mut state = STATE.load(Ordering::Relaxed);
+    if state == 0 {
+        state = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.subsec_nanos() ^ since.as_secs() as u32)
+            .unwrap_or(1)
+            .max(1);
+    }
+    for chunk in buf.chunks_mut(4) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let bytes = state.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    STATE.store(state, Ordering::Relaxed);
+}
+
 /// Like [File] but for the guest filesystem.
 #[derive(Debug)]
 pub enum GuestFile {
@@ -433,6 +474,8 @@ pub enum GuestFile {
     IpaBundleFile(IpaFile),
     ResourceFile(paths::ResourceFile),
     Socket,
+    /// An open `/dev/random` or `/dev/urandom`.
+    RandomDevice,
 }
 
 impl GuestFile {
@@ -464,6 +507,7 @@ impl GuestFile {
                 std::io::ErrorKind::Unsupported,
                 "Sync operation not supported on socket",
             )),
+            GuestFile::RandomDevice => Ok(()),
         }
     }
     pub fn set_len(&self, len: u64) -> std::io::Result<()> {
@@ -480,6 +524,10 @@ impl GuestFile {
             GuestFile::Socket => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "set_len not supported on socket",
+            )),
+            GuestFile::RandomDevice => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Attempt to resize the random device",
             )),
         }
     }
@@ -522,6 +570,7 @@ impl GuestFile {
                 ))
             }
             GuestFile::Directory => Ok(GuestFile::Directory),
+            GuestFile::RandomDevice => Ok(GuestFile::RandomDevice),
             GuestFile::Socket => {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
@@ -633,6 +682,11 @@ impl GuestFile {
                 std::io::ErrorKind::Unsupported,
                 "read not supported on socket via GuestFile",
             )),
+            // /dev/urandom never blocks and never comes up short.
+            GuestFile::RandomDevice => {
+                fill_with_random_bytes(buf);
+                Ok(buf.len())
+            }
         }
     }
 }
@@ -653,6 +707,9 @@ impl Write for GuestFile {
                 std::io::ErrorKind::Unsupported,
                 "write not supported on socket via GuestFile",
             )),
+            // Writing to /dev/urandom stirs the pool on a real system, and
+            // discarding it is a faithful enough version of that.
+            GuestFile::RandomDevice => Ok(buf.len()),
         }
     }
 
@@ -671,6 +728,7 @@ impl Write for GuestFile {
                 std::io::ErrorKind::Unsupported,
                 "flush not supported on socket via GuestFile",
             )),
+            GuestFile::RandomDevice => Ok(()),
         }
     }
 }
@@ -697,6 +755,9 @@ impl Seek for GuestFile {
                 std::io::ErrorKind::Unsupported,
                 "seek not supported on socket via GuestFile",
             )),
+            // A character device has no position to seek to; the offset
+            // stays zero whatever is asked for, as it does on a real system.
+            GuestFile::RandomDevice => Ok(0),
         }
     }
 }
@@ -918,7 +979,18 @@ impl Fs {
                         .with_child("Library", library_node),
                 ),
             )
-            .with_child("usr", FsNode::dir().with_child("lib", usr_lib));
+            .with_child("usr", FsNode::dir().with_child("lib", usr_lib))
+            // A real iOS device has these, and things that want unpredictable
+            // bytes reach for them directly rather than through an API:
+            // SQLite seeds itself from /dev/urandom, and so does anything
+            // built on OpenSSL. Without them the app gets an open() failure
+            // where every real device gives it randomness.
+            .with_child(
+                "dev",
+                FsNode::dir()
+                    .with_child("random", FsNode::random_device())
+                    .with_child("urandom", FsNode::random_device()),
+            );
         log_dbg!("Initial filesystem layout: {:#?}", root);
 
         let fs = Fs {
@@ -1083,6 +1155,7 @@ impl Fs {
                         .map_err(|_| ())
                 }
                 FileLocation::ResourceFilePath(_) => Ok(0),
+                FileLocation::RandomDevice => Ok(0),
             },
             FsNode::Directory { writeable, .. } => {
                 if let Some(host_path) = writeable {
@@ -1113,6 +1186,8 @@ impl Fs {
                     fs::metadata(path).map(|meta| meta.len()).map_err(|_| ())
                 }
                 FileLocation::ResourceFilePath(_) => Ok(0),
+                // A character device has no length.
+                FileLocation::RandomDevice => Ok(0),
             },
             FsNode::Directory { writeable, .. } => {
                 if let Some(host_path) = writeable {
@@ -1230,6 +1305,7 @@ impl Fs {
                     let resource_file = handle_open_err(paths::ResourceFile::open(name), name);
                     Ok(GuestFile::from_resource_file(resource_file))
                 }
+                FileLocation::RandomDevice => Ok(GuestFile::RandomDevice),
             },
             FsNode::Directory { .. } => Err(()),
         }
@@ -1378,6 +1454,12 @@ impl Fs {
                                 handle_open_err(paths::ResourceFile::open(name), name);
                             return Ok(GuestFile::from_resource_file(resource_file));
                         }
+                        // Opening /dev/urandom for writing is allowed on a
+                        // real system, so the read-only assertions the other
+                        // arms make do not apply here.
+                        FileLocation::RandomDevice => {
+                            return Ok(GuestFile::RandomDevice);
+                        }
                     }
                 }
                 FsNode::Directory { .. } => {
@@ -1476,7 +1558,12 @@ impl Fs {
 
                 let host_path = match location {
                     FileLocation::Path(host_path) => host_path,
-                    FileLocation::IpaFileRef(_) | FileLocation::ResourceFilePath(_) => panic!(),
+                    // None of these is a host file that could be unlinked,
+                    // and none of them is writeable, so the check above has
+                    // already turned this case away.
+                    FileLocation::IpaFileRef(_)
+                    | FileLocation::ResourceFilePath(_)
+                    | FileLocation::RandomDevice => panic!(),
                 };
                 handle_open_err(std::fs::remove_file(host_path), host_path);
                 log_dbg!(
@@ -1610,5 +1697,40 @@ impl Fs {
             },
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod random_device_tests {
+    use super::*;
+
+    #[test]
+    fn reads_fill_the_whole_buffer_and_differ() {
+        let mut device = GuestFile::RandomDevice;
+        let mut first = [0u8; 64];
+        let mut second = [0u8; 64];
+        assert_eq!(device.read(&mut first).unwrap(), first.len());
+        assert_eq!(device.read(&mut second).unwrap(), second.len());
+        // A short read is what a caller must never see from /dev/urandom.
+        assert_ne!(first, [0u8; 64], "the device returned only zeros");
+        assert_ne!(first, second, "two reads returned the same bytes");
+    }
+
+    #[test]
+    fn a_length_that_is_not_a_multiple_of_four_is_filled() {
+        // The generator works in 32-bit steps; the tail must not be left as
+        // whatever the caller had in the buffer.
+        let mut device = GuestFile::RandomDevice;
+        let mut buffer = [0xffu8; 7];
+        assert_eq!(device.read(&mut buffer).unwrap(), 7);
+        assert!(buffer.iter().any(|&byte| byte != 0xff));
+    }
+
+    #[test]
+    fn writes_are_accepted_and_seeks_stay_at_zero() {
+        let mut device = GuestFile::RandomDevice;
+        assert_eq!(device.write(b"entropy").unwrap(), 7);
+        assert_eq!(device.seek(std::io::SeekFrom::Start(100)).unwrap(), 0);
+        assert_eq!(device.seek(std::io::SeekFrom::End(0)).unwrap(), 0);
     }
 }
