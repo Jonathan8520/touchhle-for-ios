@@ -532,8 +532,66 @@ impl GuestFile {
     }
 }
 
+/// How many bytes the guest has read from files so far.
+///
+/// An app that has gone quiet is either stuck or working, and for a game the
+/// work is nearly always reading and unpacking its own data. A number that
+/// keeps climbing says which of the two it is, and costs an increment per read
+/// to know.
+///
+/// This is counted here rather than in `libc::posix_io` because `read()` is
+/// only one of the ways the guest reads a file: `Fs::read`, and through it
+/// every `NSData` and `NSBundle` load, never touches a file descriptor. A
+/// counter that saw only `read()` could report nothing at all while the app
+/// was loading steadily.
+static BYTES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn total_bytes_read() -> u64 {
+    BYTES_READ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The files the guest has opened: how many succeeded, how many failed, and
+/// the last path it asked for.
+///
+/// A game that has stopped making progress has usually stopped somewhere
+/// identifiable, and the last file it reached for names the subsystem far more
+/// directly than a guest address does.
+static OPENS: std::sync::Mutex<Option<(u64, u64, String)>> = std::sync::Mutex::new(None);
+
+fn record_open(path: &GuestPath, succeeded: bool) {
+    let Ok(mut opens) = OPENS.lock() else {
+        return;
+    };
+    let (ok, failed, last) = opens.get_or_insert_with(|| (0, 0, String::new()));
+    if succeeded {
+        *ok += 1;
+    } else {
+        *failed += 1;
+    }
+    last.clear();
+    last.push_str(path.as_str());
+}
+
+/// `(files opened, opens that failed, last path asked for)`.
+pub fn open_summary() -> (u64, u64, String) {
+    match OPENS.lock() {
+        Ok(opens) => opens.clone().unwrap_or_default(),
+        Err(_) => Default::default(),
+    }
+}
+
 impl Read for GuestFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let result = self.read_inner(buf);
+        if let Ok(count) = result {
+            BYTES_READ.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl GuestFile {
+    fn read_inner(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             GuestFile::File(file) => file.read(buf),
             GuestFile::IpaBundleFile(file) => file.read(buf),
@@ -1123,9 +1181,15 @@ impl Fs {
     /// Like [File::open] but for the guest filesystem.
     #[allow(dead_code)]
     pub fn open<P: AsRef<GuestPath>>(&self, path: P) -> Result<GuestFile, ()> {
+        let result = self.open_inner(path.as_ref());
+        record_open(path.as_ref(), result.is_ok());
+        result
+    }
+
+    fn open_inner(&self, path: &GuestPath) -> Result<GuestFile, ()> {
         // it would be nice to delegate to self.open_with_options, but
         // currently it wants a mutable reference to self
-        let node = self.lookup_node(path.as_ref()).ok_or(())?;
+        let node = self.lookup_node(path).ok_or(())?;
         match node {
             FsNode::File { location, .. } => match location {
                 FileLocation::Path(host_path) => {
@@ -1210,6 +1274,16 @@ impl Fs {
     pub fn open_with_options<P: AsRef<GuestPath>>(
         &mut self,
         path: P,
+        options: GuestOpenOptions,
+    ) -> Result<GuestFile, ()> {
+        let result = self.open_with_options_inner(path.as_ref(), options);
+        record_open(path.as_ref(), result.is_ok());
+        result
+    }
+
+    fn open_with_options_inner(
+        &mut self,
+        path: &GuestPath,
         options: GuestOpenOptions,
     ) -> Result<GuestFile, ()> {
         let GuestOpenOptions {

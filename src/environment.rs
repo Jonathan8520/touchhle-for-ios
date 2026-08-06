@@ -1607,13 +1607,20 @@ impl Environment {
             .skip(1)
             .map(|address| format!("{:#x}", address))
             .collect();
+        // A game that has gone quiet has usually gone quiet somewhere
+        // identifiable, and the last file it reached for names the subsystem
+        // far more directly than a guest address does.
+        let (opened, failed_to_open, last_path) = crate::fs::open_summary();
         log!(
-            "guest sample at {:.0}s: thread {} at {}{}, {} MiB read from files, called from {}",
+            "guest sample at {:.0}s: thread {} at {}{}, {} KiB read from {} files ({} not found, last: {:?}), called from {}",
             elapsed,
             self.current_thread,
             where_,
             others,
-            crate::libc::posix_io::total_bytes_read() / (1024 * 1024),
+            crate::fs::total_bytes_read() / 1024,
+            opened,
+            failed_to_open,
+            last_path,
             if stack.is_empty() {
                 "(no frames)".to_string()
             } else {
