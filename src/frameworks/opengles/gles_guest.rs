@@ -3313,7 +3313,12 @@ fn glShaderSource(
             let slice = env
                 .mem
                 .bytes_at(str_ptr.cast(), len.try_into().unwrap_or(0));
-            slice.to_vec()
+            // A length that counts the terminator, or that is the size of the
+            // buffer rather than of the string in it, is a common enough
+            // mistake that the drivers these apps shipped against tolerated
+            // it. GLSL has no use for a NUL, so treat one as the end of this
+            // piece.
+            shader_source_piece(slice).to_vec()
         } else {
             // GLSL shader sources can legitimately exceed the default 64KB
             // `cstr_at` safety cap (e.g. Unreal Engine's generated shaders in
@@ -3341,11 +3346,52 @@ fn glShaderSource(
     let src = normalize_shader_preprocessor_whitespace(&src);
     let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
-    let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
+    // `CString::new` refuses a string with an interior NUL, and the
+    // `unwrap_or_default()` that used to stand here turned that refusal into
+    // an empty shader — which the driver then rejected with "syntax error,
+    // unexpected end of file" and "fragment shader lacks `main'`", nowhere
+    // near the real cause. Every NUL has been cut above, so this cannot fail;
+    // if it somehow does, say so rather than compiling nothing.
+    let had_source = !bytes_vec.is_empty();
+    let cs = match std::ffi::CString::new(bytes_vec) {
+        Ok(cs) => cs,
+        Err(err) => {
+            log!(
+                "Warning: glShaderSource({}) source still contains a NUL at byte {} \
+                 after trimming; compiling it up to that point.",
+                shader,
+                err.nul_position()
+            );
+            let mut bytes = err.into_vec();
+            bytes.truncate(bytes.iter().position(|&b| b == 0).unwrap_or(0));
+            std::ffi::CString::new(bytes).unwrap_or_default()
+        }
+    };
+    if had_source && cs.as_bytes().is_empty() {
+        log!(
+            "Warning: glShaderSource({}) was given source but none of it survived; \
+             the shader will not compile.",
+            shader
+        );
+    }
     let ptr = cs.as_ptr();
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.ShaderSource(shader, 1, &ptr, std::ptr::null());
     });
+}
+
+/// One of the source strings handed to `glShaderSource`, up to its first NUL.
+///
+/// The GL spec says an explicit length is a character count and says nothing
+/// about NUL. But a caller that passes `sizeof(buffer)`, or a length that
+/// counts the terminator, is passing a NUL inside the source, and the drivers
+/// these apps shipped against accepted it. GLSL itself has no use for a NUL,
+/// so there is nothing to lose by stopping there.
+fn shader_source_piece(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|&byte| byte == 0) {
+        Some(nul) => &bytes[..nul],
+        None => bytes,
+    }
 }
 fn glEnableVertexAttribArray(env: &mut Environment, index: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -5648,5 +5694,35 @@ mod shader_preprocessor_normalization_tests {
         let out = normalize_shader_preprocessor_whitespace(&joined);
         assert!(out.contains("#endif //trailing comment"));
         assert!(!out.contains("#endif//trailing comment"));
+    }
+}
+
+#[cfg(test)]
+mod shader_source_tests {
+    use super::shader_source_piece;
+
+    #[test]
+    fn a_length_that_counts_the_terminator_does_not_lose_the_shader() {
+        // The case that produced "fragment shader lacks `main'`": the source
+        // arrived with its NUL included, CString::new refused it, and the
+        // whole shader became an empty string.
+        let with_terminator = b"void main(){}\0";
+        assert_eq!(shader_source_piece(with_terminator), b"void main(){}");
+        // A length that is the size of the buffer rather than of the string.
+        let padded = b"void main(){}\0\0\0\0";
+        assert_eq!(shader_source_piece(padded), b"void main(){}");
+    }
+
+    #[test]
+    fn source_without_a_nul_is_passed_through_whole() {
+        let exact = b"void main(){}";
+        assert_eq!(shader_source_piece(exact), exact);
+        assert_eq!(shader_source_piece(b""), b"");
+    }
+
+    #[test]
+    fn a_leading_nul_yields_nothing_rather_than_the_rest() {
+        // Truncating is what a C driver reading this as a string would do.
+        assert_eq!(shader_source_piece(b"\0void main(){}"), b"");
     }
 }
