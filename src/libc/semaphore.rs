@@ -55,7 +55,12 @@ pub fn sem_init(env: &mut Environment, sem: MutPtr<sem_t>, pshared: i32, value: 
         return 0;
     }
     let host_sem_rc = Rc::new(RefCell::new(SemaphoreHostObject {
-        value: value as i32,
+        // The count is only ever compared against zero and decremented from
+        // above it, so a value that wrapped negative here would be a
+        // semaphore no signal could ever raise: one signal takes -1 to 0,
+        // which is still not "available", and every waiter parks forever.
+        // POSIX caps the initial value at SEM_VALUE_MAX for the same reason.
+        value: clamp_initial_value(value),
         waiting: HashSet::new(),
         guest_sem: Some(sem),
         named: false,
@@ -63,6 +68,22 @@ pub fn sem_init(env: &mut Environment, sem: MutPtr<sem_t>, pshared: i32, value: 
 
     state.open_semaphores.insert(sem, host_sem_rc);
     0
+}
+
+/// An initial semaphore count, as a number that cannot be negative.
+fn clamp_initial_value(value: u32) -> i32 {
+    match i32::try_from(value) {
+        Ok(value) => value,
+        Err(_) => {
+            log!(
+                "Warning: semaphore initialised with a count of {}, which does not fit; \
+                 using {} instead.",
+                value,
+                i32::MAX
+            );
+            i32::MAX
+        }
+    }
 }
 
 pub fn sem_destroy(env: &mut Environment, sem: MutPtr<sem_t>) -> i32 {
@@ -107,7 +128,7 @@ pub fn sem_open(
                 return SEM_FAILED;
             }
             let host_sem_rc = Rc::new(RefCell::new(SemaphoreHostObject {
-                value: value as i32,
+                value: clamp_initial_value(value),
                 waiting: HashSet::new(),
                 guest_sem: None,
                 named: true,
@@ -200,3 +221,19 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sem_close(_)),
     export_c_func!(sem_unlink(_)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_initial_count_never_becomes_negative() {
+        assert_eq!(clamp_initial_value(0), 0);
+        assert_eq!(clamp_initial_value(1), 1);
+        // A count that does not fit used to wrap to -1, which no number of
+        // signals could raise above zero: every waiter parked forever.
+        assert_eq!(clamp_initial_value(u32::MAX), i32::MAX);
+        assert!(clamp_initial_value(u32::MAX) > 0);
+        assert!(clamp_initial_value(0x8000_0000) > 0);
+    }
+}

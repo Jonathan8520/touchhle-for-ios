@@ -452,16 +452,32 @@ fn dispatch_group_notify_f(
 
 // MARK: - dispatch_semaphore
 
+/// ```c
+/// dispatch_semaphore_t dispatch_semaphore_create(long value);
+/// ```
+///
 /// A dispatch semaphore is backed by one of libc's, so that waiting on it
 /// actually blocks the calling thread and signalling it actually wakes one.
-///
 /// The handle the guest gets is the address of the `sem_t`, which is what
 /// [crate::libc::semaphore] keys its own bookkeeping on.
-fn dispatch_semaphore_create(env: &mut Environment, value: i64) -> dispatch_semaphore_t {
+///
+/// `long` is 32 bits on armv7, so the count arrives in r0 alone. Declaring it
+/// as 64-bit read r0 and r1 as a pair and took whatever the guest happened to
+/// leave in r1 as the top half of the count.
+fn dispatch_semaphore_create(env: &mut Environment, value: i32) -> dispatch_semaphore_t {
     let sem: MutPtr<sem_t> = env.mem.alloc_and_write(0);
-    // A negative or absurd initial value is a guest bug; clamp rather than
-    // panic, since the guest is about to find out either way.
-    let value = value.clamp(0, i64::from(u32::MAX)) as u32;
+    // Apple returns NULL for a negative count. Nothing else here can act on
+    // that, so treat it as the empty semaphore the caller almost certainly
+    // meant, and say so.
+    let value = if value < 0 {
+        log!(
+            "dispatch_semaphore_create({}) has a negative count; creating an empty semaphore.",
+            value
+        );
+        0
+    } else {
+        value as u32
+    };
     crate::libc::semaphore::sem_init(env, sem, 0, value);
     sem.cast()
 }
