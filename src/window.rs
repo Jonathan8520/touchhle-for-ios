@@ -1952,6 +1952,13 @@ impl Window {
         self.host_framebuffer
     }
 
+    /// Size in pixels of the host window's drawable surface. This is what
+    /// [Self::viewport] is measured against, so it is the other half of any
+    /// "why is the picture in the wrong place" question.
+    pub fn drawable_size(&self) -> (u32, u32) {
+        self.window.drawable_size()
+    }
+
     /// Special offset to add to y co-ordinates, only when drawing to screen.
     pub fn viewport_y_offset(&self) -> u32 {
         #[cfg(target_os = "macos")]

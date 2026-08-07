@@ -8,7 +8,7 @@
 use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
 use crate::frameworks::foundation::ns_string;
-use crate::objc::{id, msg, msg_class, nil, objc_classes, release, Class, ClassExports};
+use crate::objc::{id, msg, msg_class, nil, objc_classes, release, Class, ClassExports, ObjC};
 use crate::Environment;
 
 // MARK: - EAGLDrawable property key constants
@@ -184,10 +184,85 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - find_fullscreen_eagl_layer
 // =========================================================================
 
+/// One line describing a layer, for [find_fullscreen_eagl_layer]'s diagnostic
+/// dump. A layer tree that fails this search is otherwise invisible: the only
+/// symptom is a black screen, which looks exactly like a tree that never got
+/// drawn at all.
+fn describe_layer(env: &Environment, layer: id) -> String {
+    let class_name = env
+        .objc
+        .get_class_name(ObjC::read_isa(layer, &env.mem))
+        .to_string();
+    let host_obj: &CALayerHostObject = env.objc.borrow(layer);
+    let children: Vec<&str> = host_obj
+        .sublayers
+        .iter()
+        .map(|&sublayer| env.objc.get_class_name(ObjC::read_isa(sublayer, &env.mem)))
+        .collect();
+    // CGRect and CGPoint are packed, so their fields can't be borrowed, which
+    // is what passing them to format! would do. Each one has to be copied out
+    // whole.
+    let width = host_obj.bounds.size.width;
+    let height = host_obj.bounds.size.height;
+    let origin_x = host_obj.bounds.origin.x;
+    let origin_y = host_obj.bounds.origin.y;
+    let position_x = host_obj.position.x;
+    let position_y = host_obj.position.y;
+    let anchor_x = host_obj.anchor_point.x;
+    let anchor_y = host_obj.anchor_point.y;
+    format!(
+        "{} {:?}: bounds {}x{} at ({}, {}), position ({}, {}), anchor ({}, {}), \
+         hidden {}, opaque {}, opacity {}, transform {}, sublayers {:?}",
+        class_name,
+        layer,
+        width,
+        height,
+        origin_x,
+        origin_y,
+        position_x,
+        position_y,
+        anchor_x,
+        anchor_y,
+        host_obj.hidden,
+        host_obj.opaque,
+        host_obj.opacity,
+        if host_obj.affine_transform.is_identity() {
+            "identity"
+        } else {
+            "not identity"
+        },
+        children,
+    )
+}
+
 /// If there is an opaque `CAEAGLLayer` that covers the entire screen, this
 /// returns a pointer to it. Otherwise, it returns [nil].
+///
+/// The first time this comes up empty it walks the tree a second time and says
+/// what it saw and which condition turned it down. Falling back to composition
+/// is a correctness-preserving choice on desktop, but on a device it is the
+/// difference between a picture and a black screen, and until now it happened
+/// in complete silence.
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
+    let layer = find_fullscreen_eagl_layer_inner(env, false);
+    if layer == nil {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            find_fullscreen_eagl_layer_inner(env, true);
+        }
+    }
+    layer
+}
+
+fn find_fullscreen_eagl_layer_inner(env: &mut Environment, explain: bool) -> id {
     if env.options.force_composition {
+        if explain {
+            log!(
+                "No fullscreen CAEAGLLayer: composition was forced with \
+                 --force-composition. [this log will only be shown once]"
+            );
+        }
         return nil;
     }
 
@@ -197,6 +272,12 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         .rev()
         .find(|&window| !msg![env; window isHidden])
     else {
+        if explain {
+            log!(
+                "No fullscreen CAEAGLLayer: not one UIWindow is visible. \
+                 [this log will only be shown once]"
+            );
+        }
         return nil;
     };
 
@@ -207,23 +288,59 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
 
     let mut layer: id = msg![env; top_window layer];
 
+    if explain {
+        let (screen_width, screen_height) = (screen_bounds.size.width, screen_bounds.size.height);
+        log!(
+            "Looking for a fullscreen CAEAGLLayer under UIWindow {:?}. The \
+             screen is {}x{}, so every layer on the way down has to be that \
+             size, centred, unrotated and fully opaque.",
+            top_window,
+            screen_width,
+            screen_height,
+        );
+    }
+
     loop {
         // assert!(layer != nil);
 
+        if explain {
+            log!("  {}", describe_layer(env, layer));
+        }
+
         let layer_host_obj: &CALayerHostObject = env.objc.borrow(layer);
 
-        if layer_host_obj.bounds.size != screen_bounds.size
-            || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
-            || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
-            || layer_host_obj.position
-                != (CGPoint {
-                    x: screen_bounds.size.width / 2.0,
-                    y: screen_bounds.size.height / 2.0,
-                })
-            || layer_host_obj.hidden
-            || layer_host_obj.opacity != 1.0
-            || !layer_host_obj.affine_transform.is_identity()
+        let rejected_because = if layer_host_obj.bounds.size != screen_bounds.size {
+            Some("its bounds are not the size of the screen")
+        } else if layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 }) {
+            Some("its bounds do not start at the origin")
+        } else if layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 }) {
+            Some("its anchor point is not the centre")
+        } else if layer_host_obj.position
+            != (CGPoint {
+                x: screen_bounds.size.width / 2.0,
+                y: screen_bounds.size.height / 2.0,
+            })
         {
+            Some("it is not positioned at the centre of the screen")
+        } else if layer_host_obj.hidden {
+            Some("it is hidden")
+        } else if layer_host_obj.opacity != 1.0 {
+            Some("it is not fully opaque")
+        } else if !layer_host_obj.affine_transform.is_identity() {
+            Some("it carries an affine transform")
+        } else {
+            None
+        };
+
+        if let Some(reason) = rejected_because {
+            if explain {
+                log!(
+                    "  ...and that is where the search stops: {}. Frames will \
+                     go through Core Animation composition instead of being \
+                     presented directly. [this log will only be shown once]",
+                    reason
+                );
+            }
             return nil;
         }
 
@@ -235,11 +352,24 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
     }
 
     if !env.objc.borrow::<CALayerHostObject>(layer).opaque {
+        if explain {
+            log!(
+                "  ...and that is where the search stops: the innermost layer \
+                 is not opaque. [this log will only be shown once]"
+            );
+        }
         return nil;
     }
 
     let ca_eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
     if !msg![env; layer isKindOfClass:ca_eagl_layer_class] {
+        if explain {
+            log!(
+                "  ...and that is where the search stops: the innermost layer \
+                 is not a CAEAGLLayer, so something is covering the one that \
+                 draws. [this log will only be shown once]"
+            );
+        }
         return nil;
     }
 

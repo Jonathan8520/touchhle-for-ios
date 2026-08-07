@@ -1691,6 +1691,32 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
     } else {
         env.window.as_mut().unwrap().rotation_matrix()
     };
+    // The numbers that decide where on the glass the frame lands. A picture
+    // that comes out squeezed, rotated or in a corner is a disagreement
+    // between these, and they are otherwise nowhere in the log.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            let window = env.window.as_ref().unwrap();
+            let (screen_width, screen_height) = window.screen_size();
+            let (drawable_width, drawable_height) = window.drawable_size();
+            log!(
+                "present_renderbuffer geometry: guest screen {}x{} in {:?} on a \
+                 {:?}, host drawable {}x{}, viewport {:?}, rotation matrix {:?} \
+                 [this log will only be shown once]",
+                screen_width,
+                screen_height,
+                device_orientation,
+                device_family,
+                drawable_width,
+                drawable_height,
+                viewport,
+                rotation_matrix.columns(),
+            );
+        }
+    }
+
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
     let drawable_framebuffer = env
         .objc

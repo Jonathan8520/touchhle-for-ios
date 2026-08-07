@@ -318,6 +318,24 @@ Other options:
         Enabling this option may solve some rendering issues, but implies
         a performance hit which is undesirable in most of the cases.
 
+    --ios-es2-direct-present
+    --no-ios-es2-direct-present
+        (iOS builds only.) Present an OpenGL ES 2.0 app's frames directly even
+        when its CAEAGLLayer isn't recognised as covering the screen, instead
+        of sending them through the compositor.
+
+        touchHLE only takes the direct presentation path when it can prove a
+        single opaque CAEAGLLayer covers the whole screen. An iPad landscape
+        game fails that test by construction: its window stays portrait
+        (768x1024) while the EAGL view it holds is landscape (1024x768), so
+        the sizes can never match. On desktop the compositor picks up the
+        slack, but on a device those frames can be lost and the screen stays
+        black while the app happily renders.
+
+        The default is off. If the picture comes out rotated or mirrored with
+        this on, pair it with --present-rotation= (see above), because this
+        path skips the layer transform the compositor would have applied.
+
     --prefer-gles2-context
         Force EAGL initWithAPI: to create an OpenGL ES 2.0 context even when
         the app requested an OpenGL ES 1.1 context.

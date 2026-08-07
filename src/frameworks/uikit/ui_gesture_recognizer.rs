@@ -46,6 +46,13 @@ pub(super) struct UIGestureRecognizerHostObject {
     initial_location: CGPoint,
     current_location: CGPoint,
     tracking: bool,
+    /// How many touches the gesture currently involves, as reported by
+    /// `-numberOfTouches`. touchHLE only ever follows one touch per
+    /// recognizer, so this is 0 or 1, but it has to stay 1 for the duration of
+    /// the action callback: apps read it there to find out where the tap was,
+    /// and a recognizer that says "no touches" while telling you it recognized
+    /// a tap gets its taps thrown away.
+    active_touches: NSUInteger,
 }
 impl HostObject for UIGestureRecognizerHostObject {}
 
@@ -68,6 +75,7 @@ impl UIGestureRecognizerHostObject {
             initial_location: CGPoint { x: 0.0, y: 0.0 },
             current_location: CGPoint { x: 0.0, y: 0.0 },
             tracking: false,
+            active_touches: 0,
         }
     }
 }
@@ -164,6 +172,29 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host = env.objc.borrow::<UIGestureRecognizerHostObject>(this);
         (host.current_location, host.view)
     };
+    if view == nil || view == own_view {
+        current_location
+    } else {
+        msg![env; view convertPoint:current_location fromView:own_view]
+    }
+}
+
+- (NSUInteger)numberOfTouches {
+    env.objc.borrow::<UIGestureRecognizerHostObject>(this).active_touches
+}
+
+- (CGPoint)locationOfTouch:(NSUInteger)touch_index
+                    inView:(id)view {
+    let (active_touches, current_location, own_view) = {
+        let host = env.objc.borrow::<UIGestureRecognizerHostObject>(this);
+        (host.active_touches, host.current_location, host.view)
+    };
+    // Only one touch is ever followed, so any other index is out of range.
+    // Apple raises an exception for that; returning the origin is the
+    // friendlier equivalent here.
+    if touch_index >= active_touches {
+        return CGPoint { x: 0.0, y: 0.0 };
+    }
     if view == nil || view == own_view {
         current_location
     } else {
@@ -288,6 +319,7 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id) {
         host.current_location = location;
         host.state = UIGestureRecognizerStatePossible;
         host.tracking = true;
+        host.active_touches = 1;
     }
 }
 
@@ -380,11 +412,17 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
             env.objc
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .state = UIGestureRecognizerStateRecognized;
+            // `active_touches` is deliberately still 1 here: the action is
+            // where an app asks the recognizer how many touches it got and
+            // where they were.
             send_action(env, recognizer);
         } else {
             env.objc
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .state = UIGestureRecognizerStateFailed;
         }
+        env.objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+            .active_touches = 0;
     }
 }
