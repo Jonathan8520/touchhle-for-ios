@@ -188,6 +188,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (())autorelease {
 }
 
+// Class objects are singletons, so copying one yields the same class. Apps
+// rely on this when they use a class as a dictionary key: NSDictionary copies
+// its keys, and a key that copies to nil is a key that cannot be looked up
+// again. Disney Infinity's ad and analytics code does exactly this with
+// MPReachability and MPGeolocationProvider.
++ (id)copyWithZone:(NSZonePtr)_zone {
+    this
+}
+
 + (())layoutSubviews {
 }
 

@@ -38,6 +38,7 @@
 //! crashes apps that parse protocol-specific fields from the body.
 
 use crate::abi::{CallFromHost, GuestFunction};
+use crate::frameworks::foundation::NSUInteger;
 use crate::mem::{ConstVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
@@ -84,6 +85,11 @@ struct NSURLSessionConfigurationHostObject {
     http_additional_headers: id,
     timeout_interval_for_request: f64,
     timeout_interval_for_resource: f64,
+    /// Connection-pool tuning knobs. Nothing here opens a connection, so these
+    /// only need to round-trip: an app that sets one and reads it back should
+    /// not be told its own value was ignored.
+    http_maximum_connections_per_host: NSUInteger,
+    http_should_use_pipelining: bool,
 }
 impl HostObject for NSURLSessionConfigurationHostObject {}
 
@@ -171,6 +177,31 @@ fn invoke_completion_handler(
         &invoke,
         env,
         (block_arg, data, response, error),
+    );
+}
+
+/// Call a block that takes a single object argument, e.g. the one
+/// `-getAllTasksWithCompletionHandler:` hands an array of tasks.
+fn invoke_block_with_one_object(env: &mut crate::Environment, block: id, argument: id) {
+    if block == nil {
+        return;
+    }
+    let block_ptr: crate::mem::MutPtr<u32> = Ptr::from_bits(block.to_bits());
+    let invoke_addr: u32 = env.mem.read(block_ptr + BLOCK_INVOKE_WORD_OFFSET);
+    if invoke_addr == 0 {
+        log!(
+            "Warning: NSURLSession block {:?} has NULL invoke pointer; not \
+             calling.",
+            block
+        );
+        return;
+    }
+    let invoke = GuestFunction::from_addr_with_thumb_bit(invoke_addr);
+    let block_arg: ConstVoidPtr = Ptr::from_bits(block.to_bits()).cast_const();
+    <GuestFunction as CallFromHost<(), (ConstVoidPtr, id)>>::call_from_host(
+        &invoke,
+        env,
+        (block_arg, argument),
     );
 }
 
@@ -302,6 +333,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         // Apple defaults: 60s request timeout, 7 days resource timeout.
         host.timeout_interval_for_request = 60.0;
         host.timeout_interval_for_resource = 604800.0;
+        // Apple's default pool size for a default configuration on iOS.
+        host.http_maximum_connections_per_host = 4;
     }
     this
 }
@@ -360,6 +393,28 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc
         .borrow_mut::<NSURLSessionConfigurationHostObject>(this)
         .timeout_interval_for_resource = value;
+}
+
+- (NSUInteger)HTTPMaximumConnectionsPerHost {
+    env.objc
+        .borrow::<NSURLSessionConfigurationHostObject>(this)
+        .http_maximum_connections_per_host
+}
+- (())setHTTPMaximumConnectionsPerHost:(NSUInteger)value {
+    env.objc
+        .borrow_mut::<NSURLSessionConfigurationHostObject>(this)
+        .http_maximum_connections_per_host = value;
+}
+
+- (bool)HTTPShouldUsePipelining {
+    env.objc
+        .borrow::<NSURLSessionConfigurationHostObject>(this)
+        .http_should_use_pipelining
+}
+- (())setHTTPShouldUsePipelining:(bool)value {
+    env.objc
+        .borrow_mut::<NSURLSessionConfigurationHostObject>(this)
+        .http_should_use_pipelining = value;
 }
 
 - (())dealloc {
@@ -463,6 +518,45 @@ pub const CLASSES: ClassExports = objc_classes! {
         completionHandler:(id)handler {
     let request: id = msg_class![env; NSURLRequest requestWithURL:url];
     make_task(env, this, request, handler)
+}
+
+- (id)uploadTaskWithRequest:(id)request
+                   fromData:(id)_body {
+    make_task(env, this, request, nil)
+}
+- (id)uploadTaskWithRequest:(id)request
+                   fromData:(id)_body
+          completionHandler:(id)handler {
+    make_task(env, this, request, handler)
+}
+- (id)uploadTaskWithRequest:(id)request
+                   fromFile:(id)_file_url {
+    make_task(env, this, request, nil)
+}
+- (id)uploadTaskWithRequest:(id)request
+                   fromFile:(id)_file_url
+          completionHandler:(id)handler {
+    make_task(env, this, request, handler)
+}
+- (id)uploadTaskWithStreamedRequest:(id)request {
+    make_task(env, this, request, nil)
+}
+
+// MARK: - Introspection
+
+- (())getTasksWithCompletionHandler:(id)handler {
+    // A session with no network still has to answer this, and answer it by
+    // calling the block: an app that asks what is in flight and never hears
+    // back waits forever. Three empty arrays is the truthful answer.
+    let empty: id = msg_class![env; NSArray array];
+    // Same ABI as a completion handler: the block takes three object
+    // arguments, here dataTasks, uploadTasks and downloadTasks.
+    invoke_completion_handler(env, handler, empty, empty, empty);
+}
+
+- (())getAllTasksWithCompletionHandler:(id)handler {
+    let empty: id = msg_class![env; NSArray array];
+    invoke_block_with_one_object(env, handler, empty);
 }
 
 // MARK: - Lifecycle
