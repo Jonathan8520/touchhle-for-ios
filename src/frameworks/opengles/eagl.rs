@@ -104,6 +104,59 @@ pub(super) struct EAGLContextHostObject {
 }
 impl HostObject for EAGLContextHostObject {}
 
+/// Look at the frame about to be presented and say whether anything is on it.
+///
+/// Reads a grid spread across the whole framebuffer rather than one block, so
+/// a legitimately dark corner does not read as an empty frame, and reports the
+/// number of distinct colours as well as the brightness: one flat fill and a
+/// picture are both "not black", but only one of them is a drawn frame.
+unsafe fn report_what_was_drawn(gles: &mut dyn GLES) {
+    const GRID: i32 = 16;
+    let mut viewport = [0i32; 4];
+    gles.GetIntegerv(gles11::VIEWPORT, viewport.as_mut_ptr());
+    let (width, height) = (viewport[2], viewport[3]);
+    if width <= 1 || height <= 1 {
+        return;
+    }
+
+    let mut colours = std::collections::HashSet::new();
+    let mut total: u64 = 0;
+    let mut pixel = [0u8; 4];
+    for row in 0..GRID {
+        for column in 0..GRID {
+            let x = column * (width - 1) / (GRID - 1);
+            let y = row * (height - 1) / (GRID - 1);
+            gles.ReadPixels(
+                x,
+                y,
+                1,
+                1,
+                gles11::RGBA,
+                gles11::UNSIGNED_BYTE,
+                pixel.as_mut_ptr() as *mut _,
+            );
+            colours.insert([pixel[0], pixel[1], pixel[2]]);
+            total += pixel[0] as u64 + pixel[1] as u64 + pixel[2] as u64;
+        }
+    }
+
+    let samples = (GRID * GRID) as u64;
+    let mean = total / (samples * 3);
+    log!(
+        "[EAGLContext presentRenderbuffer:] frame {}: {} distinct colours across {} \
+         sampled pixels, mean brightness {}/255 — {}",
+        frames_presented(),
+        colours.len(),
+        samples,
+        mean,
+        match (colours.len(), mean) {
+            (1, 0) => "the frame is entirely black",
+            (1, _) => "the frame is one flat colour",
+            _ => "something is drawn",
+        }
+    );
+}
+
 /// How many frames the app has presented.
 ///
 /// Read on the way out so a log says how long the run actually got, which
@@ -625,6 +678,17 @@ pub const CLASSES: ClassExports = objc_classes! {
             .count_frame(format_args!("EAGLContext {this:?}"), env.options.print_fps);
     }
 
+    // Every so often, look at what was actually drawn. "The screen is black"
+    // is the most common thing anyone reports about an emulator, and it is
+    // not something a log full of successful calls can confirm or deny:
+    // shaders can link, frames can be presented, and every pixel can still be
+    // zero.
+    let sample_this_frame = {
+        use std::sync::atomic::Ordering;
+        let n = FRAME_COUNTER.load(Ordering::Relaxed);
+        matches!(n, 30 | 120 | 600 | 1800 | 3600 | 7200)
+    };
+
     let fullscreen_layer = find_fullscreen_eagl_layer(env);
 
     // Unclear from documentation if this method requires the context to be
@@ -654,6 +718,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         gles.GetIntegerv(gles11::RENDERBUFFER_BINDING_OES, &mut renderbuffer);
         renderbuffer as _
     };
+
+    if sample_this_frame {
+        unsafe { report_what_was_drawn(&mut *gles) };
+    }
 
     std::mem::drop(gles);
 
