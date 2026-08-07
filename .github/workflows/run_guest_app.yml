@@ -26,6 +26,10 @@ on:
         description: Direct link to a decrypted .ipa, or an archive.org item page
         type: string
         required: false
+      app_cache_key:
+        description: Reuse an app already cached by an earlier run, instead of app_url
+        type: string
+        required: false
       log_run_id:
         description: Print the log of an earlier run of this workflow, run nothing
         type: string
@@ -156,13 +160,23 @@ jobs:
       # An app is often a couple of gigabytes, and triage means running the
       # same one over and over. Keep it between runs, both to save the twenty
       # minutes and to stop pulling it from wherever it is hosted every time.
+      # The key is the hash of the link, so triaging the same app over many
+      # runs means pasting the same link every time, and a link that has since
+      # expired means no run at all even though the app is sitting in the
+      # cache. app_cache_key names that entry directly; the run log of any
+      # earlier run of this workflow has it.
       - name: Identify the app
         id: app
         env:
           APP_URL: ${{ inputs.app_url }}
+          APP_CACHE_KEY: ${{ inputs.app_cache_key }}
         run: |
           set -eu
-          key=$(printf '%s' "$APP_URL" | sha256sum | cut -c1-32)
+          if [ -n "$APP_CACHE_KEY" ]; then
+            key=${APP_CACHE_KEY#guest-app-}
+          else
+            key=$(printf '%s' "$APP_URL" | sha256sum | cut -c1-32)
+          fi
           echo "key=$key" >> "$GITHUB_OUTPUT"
 
       - name: Try to get a cached copy of the app
@@ -179,6 +193,11 @@ jobs:
           APP_URL: ${{ inputs.app_url }}
         run: |
           set -euo pipefail
+          if [ -z "$APP_URL" ]; then
+            echo "The cache does not hold that app and no app_url was given," \
+                 "so there is nothing to run." >&2
+            exit 1
+          fi
           mkdir -p downloaded_app
           url=$APP_URL
           # An archive.org item page is not a file. Ask the metadata API which
