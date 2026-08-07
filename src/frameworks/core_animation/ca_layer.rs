@@ -124,6 +124,24 @@ impl CALayerHostObject {
     }
 }
 
+/// A layer's `affineTransform`, or [None] if it is not a layer.
+///
+/// Core Animation applies this when compositing. Code that presents a layer's
+/// contents without going through composition — the EAGL direct presenter —
+/// has to apply it itself to put the same picture on screen.
+pub fn layer_affine_transform(env: &Environment, layer: id) -> Option<CGAffineTransform> {
+    if layer == nil {
+        return None;
+    }
+    Some(
+        env.objc
+            .get_host_object(layer)?
+            .as_any()
+            .downcast_ref::<CALayerHostObject>()?
+            .affine_transform,
+    )
+}
+
 /// Set a CGImage as the tiled background pattern for this layer.
 /// Called from UIView when a pattern-based UIColor is set as backgroundColor.
 pub fn set_background_pattern_cg_image(env: &mut Environment, layer: id, cg_image: id) {

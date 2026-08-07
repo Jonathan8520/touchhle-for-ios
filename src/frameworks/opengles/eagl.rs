@@ -788,7 +788,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         // re-borrow
         unsafe {
-            present_renderbuffer(env, this);
+            present_renderbuffer(env, this, drawable);
         }
     } else {
         if fullscreen_layer != nil {
@@ -1626,7 +1626,30 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
-unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
+/// The rotation a `CAEAGLLayer`'s own affine transform applies, in radians, or
+/// [None] if it does not rotate.
+///
+/// UIKit gives an iPad landscape game's view a quarter-turn transform so that
+/// its landscape content sits correctly inside a portrait window, and Core
+/// Animation applies that transform when it composites. The direct presenter
+/// skips composition, so it has to apply the same rotation itself; without it
+/// the picture arrives on screen a quarter turn out, which is exactly what
+/// Toy Box 3.0 does on a device.
+fn layer_rotation(env: &Environment, layer: id) -> Option<f32> {
+    use crate::frameworks::core_animation::ca_layer::layer_affine_transform;
+    let transform = layer_affine_transform(env, layer)?;
+    let (a, b) = (transform.a, transform.b);
+    // A pure translation or scale has b == 0 and a > 0. Anything else carries
+    // a rotation, and atan2 recovers it.
+    let angle = (b as f32).atan2(a as f32);
+    if angle.abs() < 1e-4 {
+        None
+    } else {
+        Some(angle)
+    }
+}
+
+unsafe fn present_renderbuffer(env: &mut Environment, context: id, drawable: id) {
     // Capture this up front because the env borrow is moved into the GL
     // context machinery below.
     let trace_gl_errors = env.options.trace_gl_errors;
@@ -1678,10 +1701,36 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
         );
         crate::matrix::Matrix::<2>::identity()
     } else if is_ios_es2_override_path {
-        log_once!(
-            "iOS ES2 direct presenter: guest frame is already in display orientation, not rotating."
-        );
-        crate::matrix::Matrix::<2>::identity()
+        // Composition would have applied the layer's own transform, and the
+        // frame comes out a quarter turn wrong without it. Reproducing that
+        // transform is not a guess about what looks right: it is the same
+        // rotation, read from the same layer.
+        match layer_rotation(env, drawable) {
+            Some(angle) => {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static REPORTED: AtomicBool = AtomicBool::new(false);
+                if !REPORTED.swap(true, Ordering::Relaxed) {
+                    log!(
+                        "iOS ES2 direct presenter: applying the {:.0}° rotation the \
+                         drawable layer carries, which composition would have \
+                         applied. Pass --present-rotation= to override it. \
+                         [this log will only be shown once]",
+                        angle.to_degrees()
+                    );
+                }
+                // The matrix rotates texture co-ordinates, so displaying the
+                // image rotated by the layer's angle means rotating the
+                // co-ordinates by its negation.
+                crate::matrix::Matrix::<2>::z_rotation(-angle)
+            }
+            None => {
+                log_once!(
+                    "iOS ES2 direct presenter: the drawable layer does not rotate, \
+                     presenting the guest frame as drawn."
+                );
+                crate::matrix::Matrix::<2>::identity()
+            }
+        }
     } else if needs_autorotation_compensation {
         env.window
             .as_mut()
