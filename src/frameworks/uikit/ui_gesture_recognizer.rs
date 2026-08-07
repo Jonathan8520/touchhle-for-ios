@@ -148,6 +148,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     host.enabled = enabled;
     host.tracking = false;
     host.state = UIGestureRecognizerStatePossible;
+    // This drops the touch being followed, so the count has to go with it.
+    // touches_ended only clears recognizers it was still tracking, so a
+    // recognizer disabled mid-gesture would otherwise report that touch
+    // forever.
+    host.active_touches = 0;
 }
 - (bool)cancelsTouchesInView {
     env.objc.borrow::<UIGestureRecognizerHostObject>(this).cancels_touches_in_view
