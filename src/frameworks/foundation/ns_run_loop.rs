@@ -401,6 +401,12 @@ pub fn run_run_loop(
 
             let next_due = core_animation::recomposite_if_necessary(env, false);
             limit_sleep_time(&mut sleep_until, next_due);
+
+            // A reachability target that was scheduled for monitoring is owed
+            // a callback carrying the current state of the network, and the
+            // run loop is where the real API delivers it.
+            crate::frameworks::system_configuration::sc_network_reachability::
+                deliver_pending_callbacks(env);
         }
 
         assert!(timers_tmp.is_empty());

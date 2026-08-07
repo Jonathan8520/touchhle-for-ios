@@ -162,6 +162,66 @@ fn SCNetworkReachabilityGetFlags(
     true
 }
 
+/// Targets that have been scheduled for monitoring and are still owed their
+/// first callback.
+///
+/// The real API delivers one shortly after scheduling, carrying the current
+/// flags. An app that puts up "Connecting…" and waits to be told the state of
+/// the network waits forever without it, which looks exactly like a hang.
+static AWAITING_FIRST_CALLBACK: std::sync::Mutex<Vec<SCNetworkReachabilityRef>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn schedule_first_callback(target: SCNetworkReachabilityRef) {
+    let Ok(mut awaiting) = AWAITING_FIRST_CALLBACK.lock() else {
+        return;
+    };
+    if !awaiting.contains(&target) {
+        awaiting.push(target);
+    }
+}
+
+fn cancel_first_callback(target: SCNetworkReachabilityRef) {
+    let Ok(mut awaiting) = AWAITING_FIRST_CALLBACK.lock() else {
+        return;
+    };
+    awaiting.retain(|&t| t != target);
+}
+
+/// Deliver any callback owed to a scheduled target. Called once per iteration
+/// of the main run loop, which is where the real API would deliver it.
+pub fn deliver_pending_callbacks(env: &mut Environment) {
+    let due: Vec<SCNetworkReachabilityRef> = match AWAITING_FIRST_CALLBACK.lock() {
+        Ok(mut awaiting) if !awaiting.is_empty() => std::mem::take(&mut *awaiting),
+        _ => return,
+    };
+    for target in due {
+        let host = env
+            .objc
+            .borrow::<SCNetworkReachabilityHostObject>(target);
+        let (Some(callout), context) = (host.callout, host.context) else {
+            continue;
+        };
+        let flags: SCNetworkReachabilityFlags = if env.options.claim_network_reachable {
+            kSCNetworkReachabilityFlagsReachable
+        } else {
+            0
+        };
+        log!(
+            "SCNetworkReachability: telling {:?} the network is {}",
+            target,
+            if flags == 0 {
+                "unreachable"
+            } else {
+                "reachable"
+            }
+        );
+        <GuestFunction as crate::abi::CallFromHost<
+            (),
+            (SCNetworkReachabilityRef, SCNetworkReachabilityFlags, MutVoidPtr),
+        >>::call_from_host(&callout, env, (target, flags, context));
+    }
+}
+
 fn SCNetworkReachabilitySetCallback(
     env: &mut Environment,
     target: SCNetworkReachabilityRef,
@@ -173,31 +233,41 @@ fn SCNetworkReachabilitySetCallback(
         .borrow_mut::<SCNetworkReachabilityHostObject>(target);
     host.callout = Some(callout);
     host.context = context;
-    false
+    // Apple returns TRUE when the callback was set, and this did set it.
+    // Returning FALSE told every caller that monitoring was unavailable.
+    true
 }
 
 fn SCNetworkReachabilityScheduleWithRunLoop(
     _env: &mut Environment,
-    _target: SCNetworkReachabilityRef,
+    target: SCNetworkReachabilityRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFTypeRef,
 ) -> bool {
-    false
+    schedule_first_callback(target);
+    true
 }
 fn SCNetworkReachabilityUnscheduleFromRunLoop(
     _env: &mut Environment,
-    _target: SCNetworkReachabilityRef,
+    target: SCNetworkReachabilityRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFTypeRef,
 ) -> bool {
-    false
+    cancel_first_callback(target);
+    true
 }
 fn SCNetworkReachabilitySetDispatchQueue(
     _env: &mut Environment,
-    _target: SCNetworkReachabilityRef,
-    _queue: MutVoidPtr,
+    target: SCNetworkReachabilityRef,
+    queue: MutVoidPtr,
 ) -> bool {
-    false
+    // A NULL queue is how an app stops monitoring.
+    if queue.is_null() {
+        cancel_first_callback(target);
+    } else {
+        schedule_first_callback(target);
+    }
+    true
 }
 
 pub const FUNCTIONS: FunctionExports = &[
