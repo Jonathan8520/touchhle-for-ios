@@ -564,6 +564,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())performSelector:(SEL)sel withObject:(id)arg afterDelay:(NSTimeInterval)delay {
     log_dbg!("performSelector:{} withObject:{:?} afterDelay:{}", sel.as_str(&env.mem), arg, delay);
+    // See performSelectorOnMainThread: there is nothing to send for a
+    // selector with no name, and building a timer to discover that later is
+    // the expensive way to do nothing.
+    if sel.as_str(&env.mem).is_empty() {
+        report_empty_selector(env, "performSelector:withObject:afterDelay:", this);
+        return;
+    }
     let sel_key: id = get_static_str(env, "SEL");
     let sel_str = from_rust_string(env, sel.as_str(&env.mem).to_string());
     let arg_key: id = get_static_str(env, "arg");
@@ -586,6 +593,17 @@ pub const CLASSES: ClassExports = objc_classes! {
                        withObject:(id)arg
                     waitUntilDone:(bool)wait {
     let sel_name = sel.as_str(&env.mem);
+
+    // Nothing can be sent for a selector with no name, and scheduling it
+    // anyway is not free: every call built an NSTimer, a dictionary and two
+    // strings, put the timer on the main run loop, and left a warning when it
+    // fired and found nothing to send. Disney Infinity asks for one about
+    // five thousand times a second on a device, which is 700,000 timers and
+    // 94 MB of log in two minutes — enough to smother the app that is asking.
+    if sel_name.is_empty() {
+        report_empty_selector(env, "performSelectorOnMainThread:", this);
+        return;
+    }
 
     // Video playback selectors: instead of silently dropping these, we
     // forward them to the object so that MPMoviePlayerController's play/stop
@@ -712,9 +730,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     // out from under us) rather than panicking. With no selector there is
     // nothing to fire, so just release any waiter and bail.
     if sel_str.is_empty() {
-        log!(
-            "Warning: _touchHLE_timerFireMethod: timer {:?} has no stored selector; skipping.",
-            which
+        // Reachable only if a timer was scheduled before the checks above
+        // existed, or if the stored name was lost. Say so a few times rather
+        // than once per fire: this line reached 711,875 occurrences and 94 MB
+        // in a two-minute run, and a warning that drowns a log costs more
+        // than the thing it warns about.
+        log_once!(
+            "Warning: _touchHLE_timerFireMethod: a timer has no stored selector; \
+             skipping it and any others like it"
         );
         if let Some(sem_bits) = sem_to_post {
             let sem: crate::mem::MutPtr<crate::libc::semaphore::sem_t> =
@@ -1175,3 +1198,41 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// Report an attempt to perform a selector with no name, a few times per
+/// call site.
+///
+/// Which guest code is asking is the whole of what is worth knowing, and a
+/// caller in a loop must not be able to bury it.
+fn report_empty_selector(env: &mut Environment, what: &str, target: id) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    const PER_SITE_LIMIT: usize = 3;
+    static SEEN: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+
+    let caller = env.cpu.regs()[crate::cpu::Cpu::LR] & !1;
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let count = {
+        let mut map = seen.lock().unwrap();
+        let entry = map.entry(caller).or_insert(0);
+        *entry += 1;
+        *entry
+    };
+    if count > PER_SITE_LIMIT {
+        return;
+    }
+    let class = crate::objc::ObjC::read_isa(target, &env.mem);
+    let class_name = env.objc.get_class_name(class).to_string();
+    log!(
+        "Warning: {} asked for with an empty selector on a {:?}, called from {:#x}; \
+         there is nothing to send, so nothing was scheduled.{}",
+        what,
+        class_name,
+        caller,
+        if count == PER_SITE_LIMIT {
+            " (further calls from here will not be reported)"
+        } else {
+            ""
+        }
+    );
+}
