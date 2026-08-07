@@ -607,7 +607,7 @@ pub fn total_bytes_read() -> u64 {
 /// directly than a guest address does.
 static OPENS: std::sync::Mutex<Option<(u64, u64, String)>> = std::sync::Mutex::new(None);
 
-fn record_open(path: &GuestPath, succeeded: bool) {
+fn record_open(path: &GuestPath, working_directory: &GuestPath, succeeded: bool) {
     let Ok(mut opens) = OPENS.lock() else {
         return;
     };
@@ -621,7 +621,7 @@ fn record_open(path: &GuestPath, succeeded: bool) {
     last.push_str(path.as_str());
     drop(opens);
     if !succeeded {
-        report_open_failed(path);
+        report_open_failed(path, working_directory);
     }
 }
 
@@ -671,7 +671,7 @@ fn child_ignoring_case<'a>(
 /// NSBundle searches its localisations — so this is not a warning. But when an
 /// app stops, the file it could not find is often the reason, and a name is
 /// something to go and look for in the bundle.
-fn report_open_failed(path: &GuestPath) {
+fn report_open_failed(path: &GuestPath, working_directory: &GuestPath) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static REPORTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -685,7 +685,20 @@ fn report_open_failed(path: &GuestPath) {
     if reported.len() >= LIMIT || !reported.insert(path.as_str().to_string()) {
         return;
     }
-    log!("Note: the app looked for {:?} and it is not there", path);
+    // A relative path is only half the question: where it was resolved from
+    // decides whether it could ever have been found. An app that asks for
+    // "shared/assets/x" is asking about a different file depending on whether
+    // the working directory is its bundle or the root of the filesystem, and
+    // the name alone cannot tell those apart.
+    if path.as_str().starts_with('/') {
+        log!("Note: the app looked for {:?} and it is not there", path);
+    } else {
+        log!(
+            "Note: the app looked for {:?} (relative to {:?}) and it is not there",
+            path,
+            working_directory
+        );
+    }
 }
 
 /// `(files opened, opens that failed, last path asked for)`.
@@ -1336,7 +1349,7 @@ impl Fs {
     #[allow(dead_code)]
     pub fn open<P: AsRef<GuestPath>>(&self, path: P) -> Result<GuestFile, ()> {
         let result = self.open_inner(path.as_ref());
-        record_open(path.as_ref(), result.is_ok());
+        record_open(path.as_ref(), &self.working_directory, result.is_ok());
         result
     }
 
@@ -1432,7 +1445,7 @@ impl Fs {
         options: GuestOpenOptions,
     ) -> Result<GuestFile, ()> {
         let result = self.open_with_options_inner(path.as_ref(), options);
-        record_open(path.as_ref(), result.is_ok());
+        record_open(path.as_ref(), &self.working_directory, result.is_ok());
         result
     }
 
