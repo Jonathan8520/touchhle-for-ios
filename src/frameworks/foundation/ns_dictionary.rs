@@ -1119,8 +1119,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
-- (())setDictionary:(id)dict {
-    todo_objc_setter!(this, dict);
+- (())setDictionary:(id)dict { // NSDictionary *
+    // Apple defines this as the contents of `dict` replacing the receiver's,
+    // which is removeAllObjects followed by addEntriesFromDictionary:. It was
+    // a no-op stub, so an app that built its state and installed it this way
+    // got an empty dictionary and no indication anything had gone wrong.
+    if dict == this {
+        // Emptying first would throw away exactly what is about to be put
+        // back, and Apple leaves the dictionary alone here.
+        return;
+    }
+    () = msg![env; this removeAllObjects];
+    if dict != nil {
+        () = msg![env; this addEntriesFromDictionary:dict];
+    }
 }
 
 - (id)initWithObjectsAndKeys:(id)first_object, ...dots {

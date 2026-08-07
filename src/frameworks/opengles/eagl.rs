@@ -1622,10 +1622,6 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
     result
 }
 
-/// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
-/// (which should be provided by the app) to a texture and presents it with
-/// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
-/// doing so. The front and back buffers are then swapped.
 /// The rotation a `CAEAGLLayer`'s own affine transform applies, in radians, or
 /// [None] if it does not rotate.
 ///
@@ -1649,6 +1645,10 @@ fn layer_rotation(env: &Environment, layer: id) -> Option<f32> {
     }
 }
 
+/// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
+/// (which should be provided by the app) to a texture and presents it with
+/// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
+/// doing so. The front and back buffers are then swapped.
 unsafe fn present_renderbuffer(env: &mut Environment, context: id, drawable: id) {
     // Capture this up front because the env borrow is moved into the GL
     // context machinery below.
