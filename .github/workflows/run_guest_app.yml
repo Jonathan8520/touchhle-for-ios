@@ -73,6 +73,11 @@ on:
         type: string
         required: false
         default: ""
+      find_string:
+        description: Text shown on screen; finds it in the binary and the code that forms it
+        type: string
+        required: false
+        default: ""
       dump_classes:
         description: Objective-C class names (or parts of them) to dump, comma-separated; "all" lists every class
         type: string
@@ -464,6 +469,20 @@ jobs:
             || python3 -m pip install --quiet --break-system-packages capstone
           python3 dev-scripts/disassemble-guest.py --callchain downloaded_app/app.ipa \
             "$ADDRESS" | tee -a disassembly.txt
+
+      # An app that has stopped is usually showing something, and the words it
+      # shows are in its binary. This is the way in when the log names no
+      # address worth disassembling.
+      - name: Find the text on screen in the binary, and the code that forms it
+        if: ${{ always() && inputs.find_string != '' }}
+        env:
+          NEEDLE: ${{ inputs.find_string }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet capstone \
+            || python3 -m pip install --quiet --break-system-packages capstone
+          python3 dev-scripts/disassemble-guest.py --string downloaded_app/app.ipa \
+            "$NEEDLE" | tee -a disassembly.txt
 
       # An app's own classes are the part of it the emulator's log names but
       # cannot explain. This turns a selector from an --trace-objc run into

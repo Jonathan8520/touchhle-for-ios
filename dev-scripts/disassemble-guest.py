@@ -16,6 +16,7 @@ Usage:
     dev-scripts/disassemble-guest.py --callchain <app.ipa | ...> <address> [depth]
     dev-scripts/disassemble-guest.py --class <app.ipa | ...> <name>...
     dev-scripts/disassemble-guest.py --class-list <app.ipa | ...>
+    dev-scripts/disassemble-guest.py --string <app.ipa | ...> <substring>...
 
 `--class` goes the other way round from an address: given part of a class
 name, it prints that class's methods with the address of each one, plus its
@@ -31,6 +32,12 @@ when you do not yet know what to ask for.
 form a data address, and reports each site that forms one of the given
 addresses, saying whether it goes on to read it or write it. That is how
 you find who is supposed to fill in a global that turned out to be zero.
+
+`--string` starts from the words on the screen instead of from an address.
+An app that has stopped is usually showing something, and the text it shows
+is in the binary; this finds it, reports the Objective-C literal that points
+at it, and then sweeps for the code that forms either. That turns "which code
+puts up the Connecting dialog" into an address to disassemble.
 
 `--callchain` then walks upwards from a function: who branches to it, who
 branches to them, and so on, so the whole path can be found in one sweep
@@ -1098,6 +1105,102 @@ def report_class(data, address):
             )
 
 
+CFSTRING_STRUCT_SIZE = 16
+CFSTRING_DATA_FIELD = 8
+
+STRING_SECTIONS = ("__cstring", "__objc_methname", "__objc_classname", "__ustring")
+
+
+def find_strings(data, needles):
+    """Addresses of every string in the binary containing one of `needles`.
+
+    An app puts words on the screen and those words are in the binary. Going
+    from the words to the code that shows them is often the shortest way into
+    a subsystem that has no symbol left in it — "which code puts up the
+    Connecting dialog" is answerable, but only once the string has an address.
+
+    Objective-C literals are the wrinkle: code never forms the address of the
+    bytes, it forms the address of the CFString structure that points at
+    them. So the matching __cfstring entries are reported too, and those are
+    what --xref wants."""
+    hits = []
+    lowered = [needle.lower().encode("utf-8") for needle in needles]
+    for section in sections(data):
+        if section["name"] not in STRING_SECTIONS:
+            continue
+        offset = file_offset(data, section["addr"])
+        if offset is None:
+            continue
+        blob = data[offset : offset + section["size"]]
+        start = 0
+        for index, byte in enumerate(blob):
+            if byte != 0:
+                continue
+            piece = blob[start:index]
+            if piece and any(needle in piece.lower() for needle in lowered):
+                hits.append((section["addr"] + start, piece, section["name"]))
+            start = index + 1
+    return hits
+
+
+def cfstrings_for(data, string_addresses):
+    """`__cfstring` entries whose text is one of `string_addresses`."""
+    wanted = set(string_addresses)
+    found = {}
+    for section in sections(data):
+        if section["name"] != "__cfstring":
+            continue
+        offset = file_offset(data, section["addr"])
+        if offset is None:
+            continue
+        for at in range(0, section["size"], CFSTRING_STRUCT_SIZE):
+            if offset + at + CFSTRING_STRUCT_SIZE > len(data):
+                break
+            (text,) = struct.unpack_from("<I", data, offset + at + CFSTRING_DATA_FIELD)
+            if text in wanted:
+                found[section["addr"] + at] = text
+    return found
+
+
+def report_strings(capstone, data, needles):
+    """Print the strings matching `needles`, then what code reaches them."""
+    hits = find_strings(data, needles)
+    if not hits:
+        print("no string in the binary contains any of {!r}".format(needles))
+        return
+    print("--- {} matching string(s) ---".format(len(hits)))
+    # Longest first would bury the exact match; keep them in address order so
+    # neighbouring strings, which are usually related, stay together.
+    for address, piece, section_name in hits[:60]:
+        print(
+            "{:#010x}  {:<18} {!r}".format(
+                address, section_name, piece.decode("utf-8", "replace")[:120]
+            )
+        )
+    if len(hits) > 60:
+        print("... and {} more".format(len(hits) - 60))
+
+    string_addresses = [address for address, _piece, _section in hits]
+    cfstrings = cfstrings_for(data, string_addresses)
+    if cfstrings:
+        print("\n--- {} Objective-C literal(s) for those ---".format(len(cfstrings)))
+        for at, text in sorted(cfstrings.items()):
+            print("{:#010x}  __cfstring -> {:#x}".format(at, text))
+
+    # The literal is what code forms; the bytes are what it points at. Ask
+    # about both, because a C string used with strcmp has no literal at all.
+    targets = sorted(set(string_addresses) | set(cfstrings))
+    if len(targets) > 24:
+        print(
+            "\nToo many matches to sweep for ({}); narrow the search first.".format(
+                len(targets)
+            )
+        )
+        return
+    print("\n--- code that forms those addresses ---")
+    xref(capstone, data, targets)
+
+
 def report_class_list(data):
     """One line per class the app defines, to find out what it is made of."""
     rows = []
@@ -1233,6 +1336,17 @@ def main(argv):
             sys.exit(__doc__)
         data = armv7_slice(find_executable(argv[2]))
         report_classes(data, argv[3:])
+        return
+
+    if argv[1:2] == ["--string"]:
+        if len(argv) < 4:
+            sys.exit(__doc__)
+        try:
+            import capstone
+        except ImportError:
+            die("capstone is not installed (pip install capstone)")
+        data = armv7_slice(find_executable(argv[2]))
+        report_strings(capstone, data, argv[3:])
         return
 
     if argv[1:2] in (["--xref"], ["--callchain"]):
