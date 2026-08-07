@@ -741,6 +741,38 @@ pub const CLASSES: ClassExports = objc_classes! {
         && env.objc.borrow::<EAGLContextHostObject>(this).api
             == kEAGLRenderingAPIOpenGLES2;
 
+    // Which of the three ways a frame can reach the screen was taken, and
+    // where it is being sent. A frame that is drawn but never seen looks the
+    // same in a log as one that was never drawn, and the difference is the
+    // whole question when a screen stays black.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            let path = if drawable == fullscreen_layer {
+                "the fullscreen-layer fast path"
+            } else if use_ios_es2_direct_path {
+                "the iOS ES2 direct presenter"
+            } else if fullscreen_layer != nil {
+                "nothing: this layer is not the fullscreen one"
+            } else {
+                "Core Animation composition (the slow path)"
+            };
+            let drawable_framebuffer = env
+                .objc
+                .borrow::<EAGLContextHostObject>(this)
+                .drawable_framebuffer;
+            let host_framebuffer = env.window.as_ref().map_or(0, |w| w.host_framebuffer());
+            log!(
+                "[EAGLContext presentRenderbuffer:] presenting via {}; drawable \
+                 framebuffer {}, host framebuffer {} [this log will only be shown once]",
+                path,
+                drawable_framebuffer,
+                host_framebuffer
+            );
+        }
+    }
+
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
     // We can use the fast path where we skip composition and present directly.
     if drawable == fullscreen_layer || use_ios_es2_direct_path {
