@@ -1495,6 +1495,105 @@ fn CCHmac(
         .copy_from_slice(&result[..hash_len]);
 }
 
+// -------------------------------------------------------------------------
+// The streaming spelling of the same thing: CCHmacInit/Update/Final. An app
+// that has its message in pieces uses these rather than building the whole
+// thing to hand to CCHmac. Same sentinel-plus-side-table arrangement as the
+// CC_SHA*_Init family above: CCHmacContext is 384 bytes of guest memory whose
+// layout is Apple's business, so touchHLE keeps its own state and only writes
+// a marker there.
+// -------------------------------------------------------------------------
+
+const HMAC_INIT_SENTINEL: u32 = 0xCAFE_11AC;
+
+struct HmacState {
+    key: HmacKey,
+    /// The message so far. HmacKey::mac already assembles the whole message
+    /// internally, so holding it here costs nothing that the one-shot call
+    /// did not already cost.
+    message: Vec<u8>,
+}
+
+fn hmac_state_table() -> &'static Mutex<HashMap<u32, HmacState>> {
+    static T: OnceLock<Mutex<HashMap<u32, HmacState>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[allow(non_snake_case)]
+fn CCHmacInit(
+    env: &mut Environment,
+    ctx: MutVoidPtr,
+    algorithm: u32,
+    key: ConstVoidPtr,
+    key_length: GuestUSize,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    let Some(hash) = HmacHash::from_cc_hmac_algorithm(algorithm) else {
+        log!(
+            "CCHmacInit: unsupported algorithm {}, this context will produce nothing",
+            algorithm
+        );
+        return;
+    };
+    let key_bytes = if key_length == 0 || key.is_null() {
+        Vec::new()
+    } else {
+        env.mem.bytes_at(key.cast(), key_length).to_vec()
+    };
+    log_dbg!("CCHmacInit(algorithm={:?}, keyLen={})", hash, key_length);
+    env.mem.write(ctx.cast::<u32>(), HMAC_INIT_SENTINEL.to_le());
+    hmac_state_table().lock().unwrap().insert(
+        ctx.to_bits(),
+        HmacState {
+            key: HmacKey::new(hash, &key_bytes),
+            message: Vec::new(),
+        },
+    );
+}
+
+#[allow(non_snake_case)]
+fn CCHmacUpdate(
+    env: &mut Environment,
+    ctx: MutVoidPtr,
+    data: ConstVoidPtr,
+    data_length: GuestUSize,
+) {
+    if ctx.is_null() || data.is_null() || data_length == 0 {
+        return;
+    }
+    if u32::from_le(env.mem.read(ctx.cast::<u32>())) != HMAC_INIT_SENTINEL {
+        log!("CCHmacUpdate: this context was never initialised; ignoring.");
+        return;
+    }
+    let bytes = env.mem.bytes_at(data.cast(), data_length).to_vec();
+    if let Some(state) = hmac_state_table().lock().unwrap().get_mut(&ctx.to_bits()) {
+        state.message.extend_from_slice(&bytes);
+    }
+}
+
+#[allow(non_snake_case)]
+fn CCHmacFinal(env: &mut Environment, ctx: MutVoidPtr, mac_out: MutVoidPtr) {
+    if ctx.is_null() || mac_out.is_null() {
+        return;
+    }
+    if u32::from_le(env.mem.read(ctx.cast::<u32>())) != HMAC_INIT_SENTINEL {
+        log!("CCHmacFinal: this context was never initialised; ignoring.");
+        return;
+    }
+    // Taken out, not just read: Apple's contract is that a context is spent
+    // once finalised, and leaving it behind would leak one entry per call.
+    let Some(state) = hmac_state_table().lock().unwrap().remove(&ctx.to_bits()) else {
+        return;
+    };
+    let hash_len = state.key.hash.digest_len();
+    let result = state.key.mac(&state.message);
+    env.mem
+        .bytes_at_mut(mac_out.cast(), hash_len as GuestUSize)
+        .copy_from_slice(&result[..hash_len]);
+}
+
 // =========================================================================
 // MARK: - Security framework stubs (Keychain Services)
 // =========================================================================
@@ -2275,6 +2374,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CCKeyDerivationPBKDF(_, _, _, _, _, _, _, _, _)),
     export_c_func!(CCCalibratePBKDF(_, _, _, _, _, _)),
     export_c_func!(CCHmac(_, _, _, _, _, _)),
+    export_c_func!(CCHmacInit(_, _, _, _)),
+    export_c_func!(CCHmacUpdate(_, _, _)),
+    export_c_func!(CCHmacFinal(_, _)),
     export_c_func!(CC_MD5_Init(_)),         // Было (_, _), нужно (_)
     export_c_func!(CC_MD5_Update(_, _, _)), // Было (_, _, _, _), нужно (_, _, _)
     export_c_func!(CC_MD5_Final(_, _)),     // Было (_, _, _), нужно (_, _)
