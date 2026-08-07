@@ -341,3 +341,12 @@ com.disney.SwampyGame: --device-family=iphone-3gs
 # black screen. The direct presenter costs a readback every frame, so it stays
 # opt-in and is enabled per app here.
 com.ea.simsmedieval.bv: --ios-es2-direct-present
+
+# Disney Infinity: Toy Box 3.0 is in the same position, for the reason an iPad
+# landscape game always is: its UIWindow stays portrait (768x1024) while the
+# EAGL view inside it is landscape (1024x768), so the two sizes can never match
+# and the fullscreen-layer test can never pass. On desktop the compositor picks
+# the frame up; on a device it is lost and the screen stays black while the
+# game happily renders. The pixel sampler reports "8 distinct colours, mean
+# brightness 7/255 — something is drawn" for exactly those black frames.
+com.disney.disneyinfinity3: --ios-es2-direct-present
