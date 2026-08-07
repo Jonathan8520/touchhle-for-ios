@@ -3011,7 +3011,7 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                     listed.join(", ")
                 );
                 if s.contains("aliasing") {
-                    relink_without_phantom_bindings(gles, program, &requested, max_attribs);
+                    relink_without_phantom_bindings(gles, program, &requested, max_attribs, s);
                 }
             }
         }
@@ -3037,16 +3037,30 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
 ///
 /// This runs only where the link has already failed, so the program is
 /// unusable either way and there is nothing to regress.
+/// The attribute name a driver quoted as the one it could not place, as in
+/// "Slot 8 unavailable for 'i_sprite0' from BindAttributeLocation request."
+fn rejected_attribute_name(info_log: &str) -> Option<&str> {
+    let (_, after) = info_log.split_once('\'')?;
+    let (name, _) = after.split_once('\'')?;
+    (!name.is_empty()).then_some(name)
+}
+
 unsafe fn relink_without_phantom_bindings(
     gles: &mut dyn GLES,
     program: GLuint,
     requested: &[(GLuint, String)],
     max_attribs: GLint,
+    info_log: &str,
 ) {
     use std::collections::HashSet;
 
     let taken: HashSet<GLuint> = requested.iter().map(|(slot, _)| *slot).collect();
-    let mut free_slots = (0..max_attribs.max(0) as GLuint).filter(|slot| !taken.contains(slot));
+    // Highest first. A linker hands unbound attributes the lowest slots it
+    // can, and the mirrors below outlive this program, so a slot near the top
+    // is the least likely to mean something in another one.
+    let mut free_slots = (0..max_attribs.max(0) as GLuint)
+        .rev()
+        .filter(|slot| !taken.contains(slot));
 
     let mut moved = Vec::new();
     for slot in taken.iter().copied() {
@@ -3087,13 +3101,41 @@ unsafe fn relink_without_phantom_bindings(
                     )
                 })
                 .collect();
-            log!(
-                "Program {}: slot {} is claimed by {}, and which one the app means cannot \
-                 be told from here; leaving it as it is.",
-                program,
-                slot,
-                described.join(" and ")
-            );
+            // Every name on the slot is read, so this is real aliasing: the
+            // app means both, reading one set of vertex data as two things.
+            // The driver named the request it could not place; move that one
+            // and arrange for its new slot to be fed whatever this one is.
+            let rejected = rejected_attribute_name(info_log)
+                .filter(|name| on_this_slot.iter().any(|(_, bound)| bound == name));
+            let Some(rejected) = rejected else {
+                log!(
+                    "Program {}: slot {} is claimed by {}, and the driver did not name one \
+                     that can be moved; leaving it as it is.",
+                    program,
+                    slot,
+                    described.join(" and ")
+                );
+                continue;
+            };
+            let Some(free) = free_slots.next() else {
+                log!(
+                    "Program {}: slot {} is claimed by {} and there is no free slot to \
+                     separate them onto.",
+                    program,
+                    slot,
+                    described.join(" and ")
+                );
+                continue;
+            };
+            let Ok(cstr) = std::ffi::CString::new(rejected) else {
+                continue;
+            };
+            gles.BindAttribLocation(program, free, cstr.as_ptr());
+            record_attrib_mirror(slot, free);
+            moved.push(format!(
+                "{:?} from slot {} to {}, which will be fed whatever slot {} is",
+                rejected, slot, free, slot
+            ));
             continue;
         }
         for (index, (_, name)) in on_this_slot.iter().enumerate() {
@@ -3124,11 +3166,9 @@ unsafe fn relink_without_phantom_bindings(
     gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
     if ok != 0 {
         log!(
-            "Program {} linked after moving {} — the shaders never read {}, so the \
-             binding had no effect to lose.",
+            "Program {} linked after moving {}.",
             program,
-            moved.join(" and "),
-            if moved.len() == 1 { "it" } else { "them" }
+            moved.join(" and ")
         );
     } else {
         log!(
@@ -3632,6 +3672,43 @@ fn attribute_is_declared(program: GLuint, name: &str) -> Option<bool> {
     Some(declared)
 }
 
+/// Attribute slots that must receive a copy of everything sent to another
+/// slot, as `source -> mirrors`.
+///
+/// An app is allowed to bind two attribute names to one slot, and doing so
+/// means both read the same vertex data. GL ES says this is only defined when
+/// at most one of them is active, but PowerVR let an app alias two active
+/// attributes and Disney Infinity's sprite shader does exactly that. Apple's
+/// driver refuses to link it.
+///
+/// Splitting them onto separate slots is the only way to link, and then the
+/// second slot has to be fed what the first one is fed — which is what
+/// aliasing meant in the first place.
+static ATTRIB_ALIAS_MIRRORS: std::sync::Mutex<
+    Option<std::collections::HashMap<GLuint, Vec<GLuint>>>,
+> = std::sync::Mutex::new(None);
+
+fn record_attrib_mirror(source: GLuint, mirror: GLuint) {
+    if let Ok(mut mirrors) = ATTRIB_ALIAS_MIRRORS.lock() {
+        let for_source = mirrors
+            .get_or_insert_with(Default::default)
+            .entry(source)
+            .or_insert_with(Vec::new);
+        if !for_source.contains(&mirror) {
+            for_source.push(mirror);
+        }
+    }
+}
+
+/// The slots that mirror `source`, if any.
+fn attrib_mirrors_of(source: GLuint) -> Vec<GLuint> {
+    ATTRIB_ALIAS_MIRRORS
+        .lock()
+        .ok()
+        .and_then(|mirrors| mirrors.as_ref().and_then(|m| m.get(&source).cloned()))
+        .unwrap_or_default()
+}
+
 /// Whether any shader attached to `program` actually *uses* `name`, as opposed
 /// to merely declaring it.
 ///
@@ -3688,12 +3765,18 @@ fn shader_source_piece(bytes: &[u8]) -> &[u8] {
 }
 fn glEnableVertexAttribArray(env: &mut Environment, index: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.EnableVertexAttribArray(index)
+        gles.EnableVertexAttribArray(index);
+        for mirror in attrib_mirrors_of(index) {
+            gles.EnableVertexAttribArray(mirror);
+        }
     });
 }
 fn glDisableVertexAttribArray(env: &mut Environment, index: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.DisableVertexAttribArray(index)
+        gles.DisableVertexAttribArray(index);
+        for mirror in attrib_mirrors_of(index) {
+            gles.DisableVertexAttribArray(mirror);
+        }
     });
 }
 fn glVertexAttribPointer(
@@ -3722,6 +3805,11 @@ fn glVertexAttribPointer(
             pointer.to_bits() as usize as *const _
         };
         gles.VertexAttribPointer(index, size, type_, normalized, stride, host_ptr);
+        // An attribute split off this slot to make the program link reads the
+        // same vertex data, which is what sharing the slot meant.
+        for mirror in attrib_mirrors_of(index) {
+            gles.VertexAttribPointer(mirror, size, type_, normalized, stride, host_ptr);
+        }
     });
 }
 fn glVertexAttrib1f(env: &mut Environment, index: GLuint, x: GLfloat) {
@@ -6100,6 +6188,23 @@ mod attribute_declaration_tests {
         record_shader_source(908, "varying vec2 v;\nvoid main() { v = i_uv; }\n");
         record_shader_attached(807, 908, true);
         assert_eq!(attribute_is_used(807, "i_uv"), Some(true));
+    }
+
+    #[test]
+    fn the_rejected_attribute_name_is_read_out_of_the_driver_message() {
+        assert_eq!(
+            super::rejected_attribute_name(
+                "ERROR: Active attribute aliasing. Slot 8 unavailable for \
+                 'i_sprite0' from BindAttributeLocation request."
+            ),
+            Some("i_sprite0")
+        );
+        // A message with no name, or an empty one, must not yield a name.
+        assert_eq!(
+            super::rejected_attribute_name("ERROR: something else"),
+            None
+        );
+        assert_eq!(super::rejected_attribute_name("slot '' taken"), None);
     }
 
     #[test]
