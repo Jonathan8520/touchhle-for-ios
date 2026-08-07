@@ -104,6 +104,18 @@ pub(super) struct EAGLContextHostObject {
 }
 impl HostObject for EAGLContextHostObject {}
 
+/// How many frames the app has presented.
+///
+/// Read on the way out so a log says how long the run actually got, which
+/// decides whether "nothing appeared" means the app draws nothing or that it
+/// was closed before it had drawn anything worth seeing.
+static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The number of frames presented so far.
+pub fn frames_presented() -> u64 {
+    FRAME_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -588,8 +600,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // sink"). The milestones are roughly logarithmic so they cover the range
     // from sub-second to ~10 minutes at 60 FPS without flooding.
     {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+        use std::sync::atomic::Ordering;
         let n = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
         if matches!(n, 10 | 60 | 300 | 1800 | 3600 | 7200 | 18000 | 36000) {
             log!(

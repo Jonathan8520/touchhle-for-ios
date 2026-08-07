@@ -1679,7 +1679,11 @@ impl Environment {
         loop {
             #[cfg(target_os = "ios")]
             if crate::take_host_exit_request() {
-                echo!("Returning to the iOS host library.");
+                echo!(
+                    "Returning to the iOS host library after {:.0}s and {} frames.",
+                    self.startup_time.elapsed().as_secs_f32(),
+                    crate::frameworks::opengles::eagl::frames_presented()
+                );
                 let thread = &mut self.threads[self.current_thread];
                 assert!(thread.host_context.is_none());
                 thread.host_context = Some(curr_host_context);
