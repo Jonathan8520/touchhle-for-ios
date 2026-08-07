@@ -388,6 +388,35 @@ jobs:
             size=$(identify -format '%wx%h' "$shot" 2>/dev/null || echo '?')
             echo "$shot: $size, mean brightness $mean/255, std dev $sd, $colours distinct colours"
           done
+          # "Did anything change, and where" is the question a run is usually
+          # asked, and comparing two of these by eye — or by their statistics
+          # — cannot answer it. Consecutive screenshots are diffed here, in
+          # the order they were taken, so a screen that moved once says so
+          # even when the artifact store cannot be reached.
+          echo "===== what changed between them ====="
+          ordered=$(for shot in "${shots[@]}"; do
+            case "$shot" in
+              screenshot-final.png) echo "999999 $shot" ;;
+              *) echo "$(echo "$shot" | sed 's/[^0-9]*\([0-9]*\).*/\1/') $shot" ;;
+            esac
+          done | sort -n | cut -d' ' -f2-)
+          previous=""
+          for shot in $ordered; do
+            if [ -n "$previous" ]; then
+              # AE counts pixels that differ at all; the trim of the
+              # difference image says where they are.
+              changed=$(compare -metric AE "$previous" "$shot" null: 2>&1 | tr -d '\n' || echo '?')
+              if [ "$changed" = "0" ]; then
+                echo "$previous -> $shot: identical"
+              else
+                where=$(compare "$previous" "$shot" -compose src -highlight-color white \
+                  -lowlight-color black png:- 2>/dev/null \
+                  | convert - -trim -format '%wx%h%O' info: 2>/dev/null || echo '?')
+                echo "$previous -> $shot: $changed pixel(s) differ, in $where"
+              fi
+            fi
+            previous="$shot"
+          done
           # The artifact is the good copy, but the artifact store is not
           # reachable from everywhere this log is read. A downscaled PNG,
           # base64'd, travels wherever the log does.
