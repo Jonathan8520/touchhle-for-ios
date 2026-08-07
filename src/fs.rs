@@ -625,6 +625,44 @@ fn record_open(path: &GuestPath, succeeded: bool) {
     }
 }
 
+/// Find a directory entry whose name differs from `wanted` only in case.
+///
+/// An iPhone's filesystem is case-insensitive: HFS+ was, and the APFS volume
+/// that replaced it is too. So an app can ship `Assets/Foo.png` and ask for
+/// `assets/foo.png` and never find out, and plenty did. touchHLE's tree is a
+/// `HashMap` keyed on the exact name, which is case-*sensitive*, so those apps
+/// lose files here that they would find on a device.
+///
+/// This only runs after an exact match has already failed, and only accepts an
+/// unambiguous answer: a directory holding both `Foo` and `foo` could not
+/// exist on the device this is imitating, so guessing between them would be
+/// inventing behaviour rather than reproducing it.
+fn name_ignoring_case(children: &HashMap<String, FsNode>, wanted: &str) -> Option<String> {
+    let mut found = None;
+    for name in children.keys() {
+        if name.eq_ignore_ascii_case(wanted) {
+            if found.is_some() {
+                log_dbg!(
+                    "Not matching {:?} case-insensitively: more than one entry differs from it only in case.",
+                    wanted
+                );
+                return None;
+            }
+            found = Some(name);
+        }
+    }
+    let name = found?;
+    log_dbg!("Matched {:?} to {:?}, ignoring case.", wanted, name);
+    Some(name.clone())
+}
+
+fn child_ignoring_case<'a>(
+    children: &'a HashMap<String, FsNode>,
+    wanted: &str,
+) -> Option<&'a FsNode> {
+    children.get(&name_ignoring_case(children, wanted)?)
+}
+
 /// Say once, for each distinct path, that the guest asked for a file that is
 /// not there.
 ///
@@ -1057,7 +1095,10 @@ impl Fs {
             else {
                 return None;
             };
-            node = children.get(*component)?
+            node = match children.get(*component) {
+                Some(node) => node,
+                None => child_ignoring_case(children, component)?,
+            }
         }
         Some(node)
     }
@@ -1085,7 +1126,16 @@ impl Fs {
             else {
                 return None;
             };
-            parent = children.get_mut(component)?
+            // The directories on the way down are resolved the same way a
+            // read would resolve them (see child_ignoring_case). The final
+            // component deliberately is not: a file being created keeps
+            // exactly the name the app gave it.
+            let name = if children.contains_key(component) {
+                component.to_string()
+            } else {
+                name_ignoring_case(children, component)?
+            };
+            parent = children.get_mut(&name)?
         }
 
         Some((parent, final_component.to_string()))
@@ -1697,6 +1747,55 @@ impl Fs {
             },
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod case_insensitive_lookup_tests {
+    use super::*;
+
+    fn file() -> FsNode {
+        FsNode::File {
+            location: FileLocation::Path(PathBuf::from("/dev/null")),
+            writeable: false,
+        }
+    }
+
+    fn dir_with(names: &[&str]) -> HashMap<String, FsNode> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), file()))
+            .collect()
+    }
+
+    #[test]
+    fn a_name_that_differs_only_in_case_is_found() {
+        let children = dir_with(&["SubHeaps.xml"]);
+        assert!(child_ignoring_case(&children, "subheaps.xml").is_some());
+        assert!(child_ignoring_case(&children, "SUBHEAPS.XML").is_some());
+    }
+
+    #[test]
+    fn a_name_that_differs_in_more_than_case_is_not_found() {
+        let children = dir_with(&["SubHeaps.xml"]);
+        assert!(child_ignoring_case(&children, "subheaps.txt").is_none());
+        assert!(child_ignoring_case(&children, "subheap.xml").is_none());
+    }
+
+    #[test]
+    fn two_entries_differing_only_in_case_are_left_alone() {
+        // A device could not hold both, so there is no right answer to give.
+        let children = dir_with(&["Assets", "assets"]);
+        assert!(child_ignoring_case(&children, "ASSETS").is_none());
+    }
+
+    #[test]
+    fn an_exact_match_is_returned_by_name_unchanged() {
+        let children = dir_with(&["Assets"]);
+        assert_eq!(
+            name_ignoring_case(&children, "Assets"),
+            Some("Assets".to_string())
+        );
     }
 }
 
