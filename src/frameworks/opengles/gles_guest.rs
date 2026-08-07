@@ -3055,21 +3055,44 @@ unsafe fn relink_without_phantom_bindings(
         if on_this_slot.len() < 2 {
             continue;
         }
-        // Keep one. Prefer keeping a declared attribute; move the ones the
-        // shaders never mention.
+        // Keep the one the shaders actually read. A name that is only
+        // declared, or not mentioned at all, is one a compiler may drop, so
+        // moving its binding cannot change what the program computes — and
+        // the slot the app feeds then reaches the attribute it meant.
         let declared: Vec<bool> = on_this_slot
             .iter()
-            .map(|(_, name)| attribute_is_declared(program, name).unwrap_or(true))
+            .map(|(_, name)| {
+                attribute_is_used(program, name)
+                    .or_else(|| attribute_is_declared(program, name))
+                    .unwrap_or(true)
+            })
             .collect();
         if declared.iter().filter(|d| **d).count() != 1 {
+            let described: Vec<String> = on_this_slot
+                .iter()
+                .map(|(_, name)| {
+                    format!(
+                        "{:?} ({}, {})",
+                        name,
+                        match attribute_is_declared(program, name) {
+                            Some(true) => "declared",
+                            Some(false) => "not declared",
+                            None => "cannot say if declared",
+                        },
+                        match attribute_is_used(program, name) {
+                            Some(true) => "used",
+                            Some(false) => "never read",
+                            None => "cannot say if used",
+                        }
+                    )
+                })
+                .collect();
             log!(
-                "Program {}: slot {} is claimed by {} bindings and {} of them are declared \
-                 by the shaders, so which one the app means cannot be told from here; \
-                 leaving it as it is.",
+                "Program {}: slot {} is claimed by {}, and which one the app means cannot \
+                 be told from here; leaving it as it is.",
                 program,
                 slot,
-                on_this_slot.len(),
-                declared.iter().filter(|d| **d).count()
+                described.join(" and ")
             );
             continue;
         }
@@ -3101,8 +3124,8 @@ unsafe fn relink_without_phantom_bindings(
     gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
     if ok != 0 {
         log!(
-            "Program {} linked after moving {} — the shaders do not declare \
-             {}, so the binding had no effect to lose.",
+            "Program {} linked after moving {} — the shaders never read {}, so the \
+             binding had no effect to lose.",
             program,
             moved.join(" and "),
             if moved.len() == 1 { "it" } else { "them" }
@@ -3607,6 +3630,47 @@ fn attribute_is_declared(program: GLuint, name: &str) -> Option<bool> {
         }
     }
     Some(declared)
+}
+
+/// Whether any shader attached to `program` actually *uses* `name`, as opposed
+/// to merely declaring it.
+///
+/// This is the distinction that decides whether an attribute is active. A
+/// compiler is free to drop one that is declared and never read, and PowerVR —
+/// the driver these apps shipped against — does, which is why a binding that
+/// collides on paper links there. So a name that appears only on its own
+/// declaration line is one no driver need keep, and moving its binding cannot
+/// change what the program computes.
+///
+/// Returns `None` when the sources are not all known.
+fn attribute_is_used(program: GLuint, name: &str) -> Option<bool> {
+    let (Ok(programs), Ok(sources)) = (PROGRAM_SHADERS.lock(), SHADER_SOURCES.lock()) else {
+        return None;
+    };
+    let shaders = programs.as_ref()?.get(&program)?;
+    if shaders.is_empty() {
+        return None;
+    }
+    let sources = sources.as_ref()?;
+    let mut used = false;
+    for shader in shaders {
+        let source = sources.get(shader)?;
+        for line in source.lines() {
+            let mentions_name = line
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == name);
+            if !mentions_name {
+                continue;
+            }
+            // An attribute cannot be initialised where it is declared, so a
+            // line that declares it is not also a use of it.
+            if line.contains("attribute") {
+                continue;
+            }
+            used = true;
+        }
+    }
+    Some(used)
 }
 
 /// One of the source strings handed to `glShaderSource`, up to its first NUL.
@@ -6010,8 +6074,38 @@ mod attribute_declaration_tests {
     }
 
     #[test]
+    fn a_declared_attribute_that_is_never_read_counts_as_unused() {
+        // The case that decides Disney Infinity's sprite program: both names
+        // are declared, so "declared" cannot separate them, but only one is
+        // read. A compiler may drop the other, which is why PowerVR links
+        // this and Apple's driver does not.
+        with_source(
+            906,
+            806,
+            "attribute vec4 i_sprite0;\n\
+             attribute vec2 i_texcoord0;\n\
+             varying vec2 v_uv;\n\
+             void main() { v_uv = i_texcoord0; }\n",
+        );
+        assert_eq!(attribute_is_declared(806, "i_sprite0"), Some(true));
+        assert_eq!(attribute_is_declared(806, "i_texcoord0"), Some(true));
+        assert_eq!(attribute_is_used(806, "i_sprite0"), Some(false));
+        assert_eq!(attribute_is_used(806, "i_texcoord0"), Some(true));
+    }
+
+    #[test]
+    fn a_use_in_a_second_attached_shader_counts() {
+        record_shader_source(907, "attribute vec2 i_uv;\nvoid main() {}\n");
+        record_shader_attached(807, 907, true);
+        record_shader_source(908, "varying vec2 v;\nvoid main() { v = i_uv; }\n");
+        record_shader_attached(807, 908, true);
+        assert_eq!(attribute_is_used(807, "i_uv"), Some(true));
+    }
+
+    #[test]
     fn an_unknown_program_says_it_cannot_tell_rather_than_no() {
         assert_eq!(attribute_is_declared(8040, "i_sprite0"), None);
+        assert_eq!(attribute_is_used(8040, "i_sprite0"), None);
     }
 
     #[test]
