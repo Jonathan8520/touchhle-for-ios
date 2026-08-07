@@ -1628,11 +1628,12 @@ impl Environment {
         // want opposite fixes.
         let (allocations, allocated_bytes) = self.mem.allocated();
         log!(
-            "guest sample at {:.0}s: thread {} at {}{}, {} KiB read from {} files ({} not found, last: {:?}), {} KiB of guest memory in {} allocations, called from {}",
+            "guest sample at {:.0}s: thread {} at {}{}, {} frames presented, {} KiB read from {} files ({} not found, last: {:?}), {} KiB of guest memory in {} allocations, called from {}",
             elapsed,
             self.current_thread,
             where_,
             others,
+            crate::frameworks::opengles::frames_presented(),
             crate::fs::total_bytes_read() / 1024,
             opened,
             failed_to_open,
@@ -1682,7 +1683,7 @@ impl Environment {
                 echo!(
                     "Returning to the iOS host library after {:.0}s and {} frames.",
                     self.startup_time.elapsed().as_secs_f32(),
-                    crate::frameworks::opengles::eagl::frames_presented()
+                    crate::frameworks::opengles::frames_presented()
                 );
                 let thread = &mut self.threads[self.current_thread];
                 assert!(thread.host_context.is_none());

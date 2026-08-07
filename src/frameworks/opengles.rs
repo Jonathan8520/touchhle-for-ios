@@ -10,6 +10,8 @@
 //! topic.
 
 mod eagl;
+
+pub use eagl::frames_presented;
 mod gles_guest;
 
 use touchHLE_gl_bindings::gles11::types::{GLenum, GLint, GLsizei, GLuint};
