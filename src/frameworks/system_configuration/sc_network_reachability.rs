@@ -40,6 +40,11 @@ struct SCNetworkReachabilityHostObject {
     name: Option<String>,
     callout: Option<GuestFunction>,
     context: MutVoidPtr,
+    /// Whether the target is currently scheduled for monitoring, so that a
+    /// callback set after scheduling is still delivered. Apple's own
+    /// Reachability sample sets the callback first, but nothing requires that
+    /// order.
+    scheduled: bool,
 }
 impl HostObject for SCNetworkReachabilityHostObject {}
 
@@ -77,6 +82,7 @@ fn SCNetworkReachabilityCreateWithName(
             name: Some(name_str),
             callout: None,
             context: MutVoidPtr::null(),
+            scheduled: false,
         }),
         &mut env.mem,
     )
@@ -96,6 +102,7 @@ fn SCNetworkReachabilityCreateWithAddress(
             name: None,
             callout: None,
             context: MutVoidPtr::null(),
+            scheduled: false,
         }),
         &mut env.mem,
     )
@@ -116,6 +123,7 @@ fn SCNetworkReachabilityCreateWithAddressPair(
             name: None,
             callout: None,
             context: MutVoidPtr::null(),
+            scheduled: false,
         }),
         &mut env.mem,
     )
@@ -233,39 +241,53 @@ fn SCNetworkReachabilitySetCallback(
         .borrow_mut::<SCNetworkReachabilityHostObject>(target);
     host.callout = Some(callout);
     host.context = context;
+    let already_scheduled = host.scheduled;
+    if already_scheduled {
+        schedule_first_callback(target);
+    }
     // Apple returns TRUE when the callback was set, and this did set it.
     // Returning FALSE told every caller that monitoring was unavailable.
     true
 }
 
 fn SCNetworkReachabilityScheduleWithRunLoop(
-    _env: &mut Environment,
+    env: &mut Environment,
     target: SCNetworkReachabilityRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFTypeRef,
 ) -> bool {
+    env.objc
+        .borrow_mut::<SCNetworkReachabilityHostObject>(target)
+        .scheduled = true;
     schedule_first_callback(target);
     true
 }
 fn SCNetworkReachabilityUnscheduleFromRunLoop(
-    _env: &mut Environment,
+    env: &mut Environment,
     target: SCNetworkReachabilityRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFTypeRef,
 ) -> bool {
+    env.objc
+        .borrow_mut::<SCNetworkReachabilityHostObject>(target)
+        .scheduled = false;
     cancel_first_callback(target);
     true
 }
 fn SCNetworkReachabilitySetDispatchQueue(
-    _env: &mut Environment,
+    env: &mut Environment,
     target: SCNetworkReachabilityRef,
     queue: MutVoidPtr,
 ) -> bool {
     // A NULL queue is how an app stops monitoring.
-    if queue.is_null() {
-        cancel_first_callback(target);
-    } else {
+    let scheduled = !queue.is_null();
+    env.objc
+        .borrow_mut::<SCNetworkReachabilityHostObject>(target)
+        .scheduled = scheduled;
+    if scheduled {
         schedule_first_callback(target);
+    } else {
+        cancel_first_callback(target);
     }
     true
 }
