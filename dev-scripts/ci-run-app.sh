@@ -34,12 +34,54 @@ TAIL_PID=$!
 # the full duration. On the way, photograph the screen: a log can say the
 # render loop is alive and every frame can still be black, and only the pixels
 # settle that.
+# An app can be waiting for a tap, and a log full of a healthy render loop
+# looks exactly the same as one that is stuck. TAP_SECONDS is a comma-separated
+# list of elapsed times at which to click, and TAP_XY the point to click at,
+# defaulting to the middle of the screen.
+tap_pending="${TAP_SECONDS:-}"
+tap_point="${TAP_XY:-}"
+if [ -z "$tap_point" ] && [ -n "$tap_pending" ]; then
+    tap_point=$(xdotool getdisplaygeometry 2>/dev/null \
+        | awk '{ printf "%d,%d", $1 / 2, $2 / 2 }')
+    tap_point="${tap_point:-640,512}"
+fi
+
+# Click once at TAP_XY. Separated out because a tap that lands while the app is
+# mid-frame is worth repeating, and because a missing xdotool should say so
+# rather than silently do nothing.
+tap_screen() {
+    if ! command -v xdotool >/dev/null 2>&1; then
+        echo "no xdotool, cannot tap"
+        return
+    fi
+    tap_x=${tap_point%,*}
+    tap_y=${tap_point#*,}
+    echo "===== tapping at (${tap_x}, ${tap_y}) after ${elapsed}s ====="
+    xdotool mousemove "$tap_x" "$tap_y" 2>/dev/null || true
+    # Press and release with a gap: a recognizer that measures how long the
+    # touch lasted sees nothing in a zero-length one.
+    xdotool mousedown 1 2>/dev/null || true
+    sleep 1
+    xdotool mouseup 1 2>/dev/null || true
+}
+
 elapsed=0
 next_shot=0
 shot=0
 while [ "$elapsed" -lt "$RUN_SECONDS" ]; do
     if ! kill -0 "$APP_PID" 2>/dev/null; then
         break
+    fi
+    if [ -n "$tap_pending" ] && [ -n "${DISPLAY:-}" ]; then
+        due=${tap_pending%%,*}
+        if [ "$elapsed" -ge "$due" ]; then
+            tap_screen
+            import -window root -silent "screenshot-${elapsed}s-after-tap.png" 2>/dev/null || true
+            case "$tap_pending" in
+                *,*) tap_pending=${tap_pending#*,} ;;
+                *) tap_pending="" ;;
+            esac
+        fi
     fi
     if [ -n "${DISPLAY:-}" ] && [ "$elapsed" -ge "$next_shot" ] && command -v import >/dev/null 2>&1; then
         shot=$((shot + 1))

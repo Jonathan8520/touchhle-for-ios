@@ -48,6 +48,16 @@ on:
         type: string
         required: false
         default: ""
+      tap_at:
+        description: 'Seconds at which to tap the screen, comma-separated (e.g. "60,90")'
+        type: string
+        required: false
+        default: ""
+      tap_xy:
+        description: 'Where to tap, as "x,y" in screen pixels; defaults to the centre'
+        type: string
+        required: false
+        default: ""
       disassemble:
         description: Guest addresses from the log to disassemble, comma-separated hex
         type: string
@@ -129,6 +139,7 @@ jobs:
             libegl1-mesa-dev \
             libgl1-mesa-dri \
             imagemagick \
+            xdotool \
             xvfb
 
       - name: Cache Rust build artifacts
@@ -338,6 +349,8 @@ jobs:
         env:
           RUN_SECONDS: ${{ inputs.run_seconds }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
+          TAP_SECONDS: ${{ inputs.tap_at }}
+          TAP_XY: ${{ inputs.tap_xy }}
         run: |
           set -uo pipefail
           # Big enough for a landscape iPad window (1024x768) as well as a
