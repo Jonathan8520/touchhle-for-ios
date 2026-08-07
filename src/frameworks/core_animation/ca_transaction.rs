@@ -6,7 +6,9 @@
 //! `CAAnimation` and its subclasses
 use std::collections::HashMap;
 
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{ConstantExports, HostConstant};
+use crate::mem::{ConstVoidPtr, MutPtr, Ptr};
 use crate::frameworks::core_animation::ca_media_timing_function::kCAMediaTimingFunctionDefault;
 use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
@@ -96,6 +98,36 @@ impl State {
             .get_mut(&current_thread)
             .and_then(|thread_state| thread_state.explicit_transactions.pop())
     }
+
+    /// Lift the innermost transaction out so it can be mutated by code that
+    /// needs to send messages, which cannot happen while it is borrowed from
+    /// `env`. The flag records which stack it came from; hand both back to
+    /// [State::put_current_transaction_back].
+    fn take_current_transaction(env: &mut Environment) -> Option<(Transaction, bool)> {
+        let current_thread = env.current_thread;
+        let thread_state = State::get_mut(env).transactions.get_mut(&current_thread)?;
+        if let Some(transaction) = thread_state.explicit_transactions.pop() {
+            Some((transaction, true))
+        } else {
+            thread_state
+                .implicit_transaction
+                .take()
+                .map(|transaction| (transaction, false))
+        }
+    }
+
+    fn put_current_transaction_back(
+        env: &mut Environment,
+        transaction: Transaction,
+        was_explicit: bool,
+    ) {
+        let thread_state = State::get_current_thread_state_mut(env);
+        if was_explicit {
+            thread_state.explicit_transactions.push(transaction);
+        } else {
+            thread_state.implicit_transaction = Some(transaction);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -123,6 +155,10 @@ pub struct Transaction {
     animation_timing_function: id, // CAMediaTimingFunction*
     data: HashMap<String, id>,
     animations: Vec<(id, id)>, // CALayer*, CAAnimation*
+    /// Block to run once the transaction's animations have been handed over,
+    /// retained (as a heap copy) until then. An app that sequences its UI on
+    /// these blocks stops dead if they are never called.
+    completion_block: id,
 }
 impl Transaction {
     fn new(env: &mut Environment) -> Self {
@@ -135,7 +171,20 @@ impl Transaction {
             animation_timing_function,
             data: HashMap::default(),
             animations: Vec::default(),
+            completion_block: nil,
         }
+    }
+
+    /// Replace the completion block, copying the new one to the heap as Apple's
+    /// contract requires and releasing whichever it displaces.
+    fn set_completion_block(&mut self, env: &mut Environment, block: id) {
+        let copied: id = if block == nil {
+            nil
+        } else {
+            msg![env; block copy]
+        };
+        let old = std::mem::replace(&mut self.completion_block, copied);
+        release(env, old);
     }
 
     // Unused until support for UIView animations is implemented.
@@ -162,7 +211,36 @@ impl Transaction {
         for (_key, value) in self.data {
             release(env, value);
         }
+
+        // Apple runs this once the transaction's animations have completed.
+        // touchHLE hands them to their layers above and does not track when
+        // they finish, so it runs here instead. Running it at the wrong moment
+        // is a much smaller error than never running it: an app that chains
+        // its next step onto this block would otherwise never take it.
+        if self.completion_block != nil {
+            invoke_completion_block(env, self.completion_block);
+            release(env, self.completion_block);
+        }
     }
+}
+
+/// Call a `void (^)(void)` block, i.e. the one `+setCompletionBlock:` takes.
+fn invoke_completion_block(env: &mut Environment, block: id) {
+    // Apple Block ABI: word offset 3 holds the invoke function pointer.
+    // <https://clang.llvm.org/docs/Block-ABI-Apple.html>
+    let block_ptr: MutPtr<u32> = Ptr::from_bits(block.to_bits());
+    let invoke_addr: u32 = env.mem.read(block_ptr + 3);
+    if invoke_addr == 0 {
+        log!(
+            "Warning: CATransaction completion block {:?} has NULL invoke \
+             pointer; not calling.",
+            block
+        );
+        return;
+    }
+    let invoke = GuestFunction::from_addr_with_thumb_bit(invoke_addr);
+    let block_arg: ConstVoidPtr = Ptr::from_bits(block.to_bits()).cast_const();
+    <GuestFunction as CallFromHost<(), (ConstVoidPtr,)>>::call_from_host(&invoke, env, (block_arg,));
 }
 
 pub const kCATransactionAnimationDuration: &str = "animationDuration";
@@ -225,14 +303,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         },
         kCATransactionCompletionBlock => {
-            // We do not implement ObjC blocks (^{ ... }) yet so we cannot
-            // invoke a completion block; storing it as plain data is the
-            // closest safe behaviour for guests that simply set it as a
-            // side-effect of using +setValue:forKey: with their own keys.
-            log!(
-                "Warning: [CATransaction setValue:forKey:kCATransactionCompletionBlock] is not supported; ignoring block {:?}.",
-                value
-            );
+            () = msg![env; this setCompletionBlock:value];
         },
         _ => {
             if let Some(transaction) = State::get_current_transaction_mut(env) {
@@ -273,8 +344,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 })
         },
         kCATransactionCompletionBlock => {
-            log!("Warning: [CATransaction valueForKey:kCATransactionCompletionBlock] not supported; returning nil.");
-            nil
+            msg![env; this completionBlock]
         },
         _ => {
             State::get_current_transaction(env)
@@ -284,6 +354,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
     log_dbg!("[CATransaction valueForKey:{:?} ({})] => {:?}", key, key_string, value);
     value
+}
+
++ (id)completionBlock {
+    State::get_current_transaction(env)
+        .map(|t| t.completion_block)
+        .unwrap_or(nil)
+}
+
++ (())setCompletionBlock:(id)block {
+    let Some((mut transaction, was_explicit)) = State::take_current_transaction(env) else {
+        log!(
+            "Warning: [CATransaction setCompletionBlock:{:?}] called outside a \
+             transaction; ignoring.",
+            block
+        );
+        return;
+    };
+    // Taken out and put back because copying the block is a message send, and
+    // that cannot happen while the transaction is borrowed from `env`.
+    transaction.set_completion_block(env, block);
+    State::put_current_transaction_back(env, transaction, was_explicit);
 }
 
 + (())begin {
