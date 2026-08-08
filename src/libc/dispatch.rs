@@ -19,6 +19,7 @@ use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::libc::semaphore::sem_t;
 use crate::Environment;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 // MARK: - Types
 
@@ -502,24 +503,44 @@ fn dispatch_semaphore_wait(env: &mut Environment, sem: dispatch_semaphore_t, tim
             false => 49,
         };
     }
-    // A finite timeout is treated as an unbounded one. Waiting too long is
-    // survivable in a way that not waiting at all is not, and no guest seen so
-    // far uses a dispatch semaphore for anything but "wait until this is
-    // done".
-    if timeout != DISPATCH_TIME_FOREVER {
-        log_once_finite_timeout(timeout);
+    if timeout == DISPATCH_TIME_FOREVER {
+        env.sem_decrement(sem, true);
+        return 0;
     }
-    env.sem_decrement(sem, true);
-    0
+
+    // A finite timeout used to be treated as an unbounded one, on the grounds
+    // that waiting too long is more survivable than not waiting at all. It is
+    // not: an app that asks for a deadline has a path for the signal never
+    // arriving, and never letting it take that path is how "Connecting…
+    // Please Wait" stays on screen for as long as the app is left running.
+    //
+    // touchHLE's `dispatch_time` counts from `DISPATCH_TIME_NOW`, which is
+    // zero, so a `dispatch_time_t` that is not one of the two sentinels is a
+    // number of nanoseconds from when it was computed.
+    let deadline = Instant::now() + Duration::from_nanos(timeout);
+    match env.sem_decrement_until(sem, true, Some(deadline)) {
+        true => 0,
+        false => {
+            // Emulation is slower than the hardware these timeouts were
+            // chosen for, so one that fires here might not have fired on a
+            // real device. Say so once: an app that takes a wrong turn after
+            // this is the one place that would explain it.
+            log_once_timed_out(timeout);
+            // Apple returns KERN_OPERATION_TIMED_OUT; all a caller can do with
+            // it is distinguish it from zero.
+            49
+        }
+    }
 }
 
-fn log_once_finite_timeout(timeout: u64) {
+fn log_once_timed_out(timeout: u64) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static REPORTED: AtomicBool = AtomicBool::new(false);
     if !REPORTED.swap(true, Ordering::Relaxed) {
         log!(
-            "dispatch_semaphore_wait() called with a finite timeout ({:#x});              touchHLE waits without a deadline. [this log will only be shown once]",
-            timeout
+            "dispatch_semaphore_wait() gave up after its {} ms timeout, as it would on a device. \
+             [this log will only be shown once]",
+            Duration::from_nanos(timeout).as_millis(),
         );
     }
 }

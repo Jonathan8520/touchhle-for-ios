@@ -407,6 +407,11 @@ pub fn run_run_loop(
             // run loop is where the real API delivers it.
             crate::frameworks::system_configuration::sc_network_reachability::
                 deliver_pending_callbacks(env);
+
+            // Likewise a stream scheduled with the run loop: its client has to
+            // be told what became of it, even (especially) when the answer is
+            // that the connection could not be made.
+            crate::frameworks::core_foundation::cf_stream::deliver_pending_events(env);
         }
 
         assert!(timers_tmp.is_empty());

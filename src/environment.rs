@@ -143,8 +143,8 @@ pub enum ThreadBlock {
     Sleeping(Instant),
     // Thread is waiting for a mutex to unlock.
     Mutex(MutexId),
-    // Thread is waiting on a semaphore.
-    Semaphore(MutPtr<sem_t>),
+    // Thread is waiting on a semaphore, optionally only until an instant.
+    Semaphore(MutPtr<sem_t>, Option<Instant>),
     // Thread is waiting on a condition variable
     Condition(MutPtr<pthread_cond_t>, Option<Duration>),
     // Thread is waiting for another thread to finish (joining).
@@ -1380,6 +1380,19 @@ impl Environment {
     /// execution of the current host thread (if the semaphore is
     /// currently at 0).
     pub fn sem_decrement(&mut self, sem: MutPtr<sem_t>, wait_on_lock: bool) -> bool {
+        self.sem_decrement_until(sem, wait_on_lock, None)
+    }
+
+    /// Like [Self::sem_decrement], but gives up at `deadline` if the semaphore
+    /// has not been signalled by then, returning `false`.
+    ///
+    /// `None` waits without a deadline, which is what a plain `sem_wait` does.
+    pub fn sem_decrement_until(
+        &mut self,
+        sem: MutPtr<sem_t>,
+        wait_on_lock: bool,
+        deadline: Option<Instant>,
+    ) -> bool {
         let host_sem_rc: &mut _ = self
             .libc_state
             .semaphore
@@ -1413,8 +1426,18 @@ impl Environment {
         host_sem.waiting.insert(self.current_thread);
         std::mem::drop(host_sem);
         // The scheduler will decrement the semaphore value when it unblocks.
-        self.yield_thread(ThreadBlock::Semaphore(sem));
-        true
+        self.yield_thread(ThreadBlock::Semaphore(sem, deadline));
+
+        // Back here, the thread was either signalled or timed out; only the
+        // scheduler knows which, and it says so by leaving the thread in
+        // `timed_out`. A semaphore destroyed while this thread was parked on
+        // it is gone from the table entirely; report success, as this did
+        // unconditionally before there was a timeout to report.
+        let thread = self.current_thread;
+        match self.libc_state.semaphore.open_semaphores.get_mut(&sem) {
+            Some(host_sem_rc) => !(*host_sem_rc).borrow_mut().timed_out.remove(&thread),
+            None => true,
+        }
     }
 
     /// Unlock a semaphore (increments value of a semaphore).
@@ -1543,7 +1566,7 @@ impl Environment {
                 // The count is the whole question for a semaphore: a thread
                 // parked on one at zero is waiting for a signal that has not
                 // come, and there is no other reason to be here.
-                ThreadBlock::Semaphore(ptr) => {
+                ThreadBlock::Semaphore(ptr, deadline) => {
                     let count = self
                         .libc_state
                         .semaphore
@@ -1551,7 +1574,18 @@ impl Environment {
                         .get(ptr)
                         .map(|sem| sem.borrow().value.to_string())
                         .unwrap_or_else(|| "?".to_string());
-                    format!("semaphore {:?} (count {})", ptr, count)
+                    format!(
+                        "semaphore {:?} (count {}{})",
+                        ptr,
+                        count,
+                        match deadline {
+                            None => String::new(),
+                            Some(deadline) => format!(
+                                ", giving up in {:.1}s",
+                                deadline.saturating_duration_since(Instant::now()).as_secs_f32()
+                            ),
+                        }
+                    )
                 }
                 // Which queue the thread is in decides what is wrong. In
                 // `waiting`, nobody has signalled it yet. In `waking`, a
@@ -2494,7 +2528,7 @@ impl Environment {
                             return thread_id;
                         }
                     }
-                    ThreadBlock::Semaphore(sem) => {
+                    ThreadBlock::Semaphore(sem, deadline) => {
                         let host_sem_rc: &mut _ = self
                             .libc_state
                             .semaphore
@@ -2518,6 +2552,29 @@ impl Environment {
                             host_sem.waiting.remove(&thread_id);
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
+                        } else if let Some(deadline) = deadline {
+                            // A wait with a deadline is a wait the app is
+                            // prepared to lose: it has a path for the signal
+                            // never arriving, and taking it is the whole point
+                            // of asking for a deadline.
+                            let now = Instant::now();
+                            if deadline <= now {
+                                log_dbg!(
+                                    "Thread {} has timed out on semaphore {:?}",
+                                    thread_id,
+                                    sem
+                                );
+                                host_sem.waiting.remove(&thread_id);
+                                host_sem.timed_out.insert(thread_id);
+                                self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                                return thread_id;
+                            }
+                            // Nothing else may be runnable, so the scheduler
+                            // has to know to come back for this.
+                            next_awakening = match next_awakening {
+                                None => Some(deadline),
+                                Some(other) => Some(other.min(deadline)),
+                            };
                         }
                     }
                     ThreadBlock::Condition(cond, deadline) => {

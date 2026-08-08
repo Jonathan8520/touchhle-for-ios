@@ -40,6 +40,10 @@ pub type sem_t = i32;
 pub struct SemaphoreHostObject {
     pub value: i32,
     pub waiting: HashSet<ThreadId>,
+    /// Threads whose wait ran out of time before the semaphore was signalled.
+    /// The scheduler puts a thread here and wakes it; the wait it returns to
+    /// takes it back out and reports the timeout to its caller.
+    pub timed_out: HashSet<ThreadId>,
     guest_sem: Option<MutPtr<sem_t>>,
     named: bool,
 }
@@ -62,6 +66,7 @@ pub fn sem_init(env: &mut Environment, sem: MutPtr<sem_t>, pshared: i32, value: 
         // POSIX caps the initial value at SEM_VALUE_MAX for the same reason.
         value: clamp_initial_value(value),
         waiting: HashSet::new(),
+        timed_out: HashSet::new(),
         guest_sem: Some(sem),
         named: false,
     }));
@@ -130,6 +135,7 @@ pub fn sem_open(
             let host_sem_rc = Rc::new(RefCell::new(SemaphoreHostObject {
                 value: clamp_initial_value(value),
                 waiting: HashSet::new(),
+                timed_out: HashSet::new(),
                 guest_sem: None,
                 named: true,
             }));

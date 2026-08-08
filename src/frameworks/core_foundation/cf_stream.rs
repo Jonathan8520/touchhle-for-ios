@@ -5,12 +5,13 @@
  */
 //! `CFStream` — `CFReadStream` and `CFWriteStream` stubs.
 
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef;
 use crate::frameworks::core_foundation::cf_string::CFStringRef;
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::foundation::ns_string;
-use crate::mem::{ConstPtr, MutPtr, MutVoidPtr};
+use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{nil, objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
@@ -279,11 +280,29 @@ pub const CONSTANTS: ConstantExports = &[
 
 // MARK: - ObjC backing classes
 
+/// A callback registered with `CFReadStreamSetClient` /
+/// `CFWriteStreamSetClient`, together with the `info` pointer from the
+/// `CFStreamClientContext` it was registered with.
+#[derive(Copy, Clone)]
+struct StreamClient {
+    callback: GuestFunction,
+    info: MutVoidPtr,
+    /// Which events the client asked to hear about.
+    events: CFStreamEventType,
+}
+
 #[derive(Default)]
 struct CFReadStreamHostObject {
     status: CFStreamStatus,
     offset: usize,
     data: Vec<u8>,
+    client: Option<StreamClient>,
+    scheduled: bool,
+    /// Whether this stream stands in for a network connection. touchHLE has
+    /// no network stack, so one of these can never carry any bytes.
+    network: bool,
+    /// Which one-shot events have already been delivered.
+    delivered: CFStreamEventType,
 }
 impl HostObject for CFReadStreamHostObject {}
 
@@ -291,6 +310,12 @@ impl HostObject for CFReadStreamHostObject {}
 struct CFWriteStreamHostObject {
     status: CFStreamStatus,
     data: Vec<u8>,
+    client: Option<StreamClient>,
+    scheduled: bool,
+    /// See [CFReadStreamHostObject::network].
+    network: bool,
+    /// Which one-shot events have already been delivered.
+    delivered: CFStreamEventType,
 }
 impl HostObject for CFWriteStreamHostObject {}
 
@@ -300,12 +325,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation _touchHLE_CFReadStream: NSObject
 - (())dealloc {
+    forget_stream(this);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CFWriteStream: NSObject
 - (())dealloc {
+    forget_stream(this);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
@@ -315,6 +342,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Internal helpers
 
 fn alloc_read_stream(env: &mut Environment) -> CFReadStreamRef {
+    alloc_read_stream_inner(env, false)
+}
+
+/// Like [alloc_read_stream], but for a stream standing in for a network
+/// connection touchHLE cannot make.
+fn alloc_network_read_stream(env: &mut Environment) -> CFReadStreamRef {
+    alloc_read_stream_inner(env, true)
+}
+
+fn alloc_read_stream_inner(env: &mut Environment, network: bool) -> CFReadStreamRef {
     let class = env
         .objc
         .get_known_class("_touchHLE_CFReadStream", &mut env.mem);
@@ -324,12 +361,26 @@ fn alloc_read_stream(env: &mut Environment) -> CFReadStreamRef {
             status: kCFStreamStatusNotOpen,
             offset: 0,
             data: Vec::new(),
+            client: None,
+            scheduled: false,
+            network,
+            delivered: kCFStreamEventNone,
         }),
         &mut env.mem,
     )
 }
 
 fn alloc_write_stream(env: &mut Environment) -> CFWriteStreamRef {
+    alloc_write_stream_inner(env, false)
+}
+
+/// Like [alloc_write_stream], but for a stream standing in for a network
+/// connection touchHLE cannot make.
+fn alloc_network_write_stream(env: &mut Environment) -> CFWriteStreamRef {
+    alloc_write_stream_inner(env, true)
+}
+
+fn alloc_write_stream_inner(env: &mut Environment, network: bool) -> CFWriteStreamRef {
     let class = env
         .objc
         .get_known_class("_touchHLE_CFWriteStream", &mut env.mem);
@@ -338,6 +389,10 @@ fn alloc_write_stream(env: &mut Environment) -> CFWriteStreamRef {
         Box::new(CFWriteStreamHostObject {
             status: kCFStreamStatusNotOpen,
             data: Vec::new(),
+            client: None,
+            scheduled: false,
+            network,
+            delivered: kCFStreamEventNone,
         }),
         &mut env.mem,
     )
@@ -464,15 +519,14 @@ fn CFStreamCreatePairWithSocketToHost(
     // Many apps do not nil-check the returned streams before calling
     // CFReadStreamOpen / CFReadStreamSetProperty etc. Returning NULL causes
     // the ObjC runtime to hit the phantom-object fallback path and produce
-    // "SUPER HACK! Faking borrow_mut" warnings. A stub stream that
-    // immediately reports "at end" (for reads) or "closed" (for writes)
-    // after open is a safer contract.
+    // "SUPER HACK! Faking borrow_mut" warnings. A stub stream that reports
+    // the connection as failed once it is opened is a safer contract.
     if !read_stream.is_null() {
-        let rs = alloc_read_stream(env);
+        let rs = alloc_network_read_stream(env);
         env.mem.write(read_stream, rs);
     }
     if !write_stream.is_null() {
-        let ws = alloc_write_stream(env);
+        let ws = alloc_network_write_stream(env);
         env.mem.write(write_stream, ws);
     }
 }
@@ -533,14 +587,29 @@ fn CFWriteStreamGetStatus(env: &mut Environment, stream: CFWriteStreamRef) -> CF
     env.objc.borrow::<CFWriteStreamHostObject>(stream).status
 }
 
-fn CFReadStreamGetError(_env: &mut Environment, _stream: CFReadStreamRef) -> u64 {
-    // CFStreamError (two i32 fields packed)
-    // domain=kCFStreamErrorDomainCustom, error=-1
-    ((kCFStreamErrorDomainCustom as u64) & 0xFFFF_FFFF) | ((-1i32 as u32 as u64) << 32)
+/// `CFStreamError` is `{ CFStreamErrorDomain domain; SInt32 error; }`, which is
+/// returned in a register pair.
+fn packed_stream_error(domain: CFStreamErrorDomain, error: i32) -> u64 {
+    ((domain as u32 as u64) & 0xFFFF_FFFF) | ((error as u32 as u64) << 32)
 }
 
-fn CFWriteStreamGetError(_env: &mut Environment, _stream: CFWriteStreamRef) -> u64 {
-    ((kCFStreamErrorDomainCustom as u64) & 0xFFFF_FFFF) | ((-1i32 as u32 as u64) << 32)
+/// What a stream that stood in for a connection touchHLE could not make
+/// reports when asked why it failed. `ENETDOWN` is the honest answer, and the
+/// same one `SCNetworkReachability` gives.
+const ENETDOWN: i32 = 50;
+
+fn CFReadStreamGetError(env: &mut Environment, stream: CFReadStreamRef) -> u64 {
+    if !stream.is_null() && env.objc.borrow::<CFReadStreamHostObject>(stream).network {
+        return packed_stream_error(kCFStreamErrorDomainPOSIX, ENETDOWN);
+    }
+    packed_stream_error(kCFStreamErrorDomainCustom, -1)
+}
+
+fn CFWriteStreamGetError(env: &mut Environment, stream: CFWriteStreamRef) -> u64 {
+    if !stream.is_null() && env.objc.borrow::<CFWriteStreamHostObject>(stream).network {
+        return packed_stream_error(kCFStreamErrorDomainPOSIX, ENETDOWN);
+    }
+    packed_stream_error(kCFStreamErrorDomainCustom, -1)
 }
 
 // MARK: - Read / Write
@@ -655,60 +724,272 @@ fn CFWriteStreamSetProperty(
 
 // MARK: - Client / Run loop scheduling
 
+/// Streams scheduled with a run loop that may still owe their client an event.
+///
+/// A stubbed API that quietly drops the callback it was handed does not look
+/// like a failure to the app that registered it — it looks like a reply that
+/// has not arrived yet, and an app waiting for one of those waits for as long
+/// as it is left running. Whatever a stream here can or cannot do, its client
+/// has to be told, which is what this list is for.
+static SCHEDULED_STREAMS: std::sync::Mutex<Vec<(CFTypeRef, bool /* is a read stream */)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn remember_stream(stream: CFTypeRef, is_read: bool) {
+    let Ok(mut scheduled) = SCHEDULED_STREAMS.lock() else {
+        return;
+    };
+    if !scheduled.iter().any(|&(s, _)| s == stream) {
+        scheduled.push((stream, is_read));
+    }
+}
+
+fn forget_stream(stream: CFTypeRef) {
+    let Ok(mut scheduled) = SCHEDULED_STREAMS.lock() else {
+        return;
+    };
+    scheduled.retain(|&(s, _)| s != stream);
+}
+
+/// The `info` field of the `CFStreamClientContext` the client was registered
+/// with, which is the third argument its callback is called with. The struct
+/// is `{ CFIndex version; void *info; … }`, so `info` is one word in.
+fn client_context_info(env: &Environment, client_ctx: MutVoidPtr) -> MutVoidPtr {
+    if client_ctx.is_null() {
+        return Ptr::null();
+    }
+    env.mem.read(client_ctx.cast::<MutVoidPtr>() + 1)
+}
+
+fn make_client(
+    env: &Environment,
+    stream_events: CFStreamEventType,
+    client_cb: GuestFunction,
+    client_ctx: MutVoidPtr,
+) -> Option<StreamClient> {
+    if client_cb.addr_without_thumb_bit() == 0 {
+        // Apple's documented way to remove a client.
+        return None;
+    }
+    Some(StreamClient {
+        callback: client_cb,
+        info: client_context_info(env, client_ctx),
+        events: stream_events,
+    })
+}
+
 fn CFReadStreamSetClient(
-    _env: &mut Environment,
-    _stream: CFReadStreamRef,
-    _stream_events: CFStreamEventType,
-    _client_cb: MutVoidPtr,
-    _client_ctx: MutVoidPtr,
+    env: &mut Environment,
+    stream: CFReadStreamRef,
+    stream_events: CFStreamEventType,
+    client_cb: GuestFunction,
+    client_ctx: MutVoidPtr,
 ) -> bool {
+    if stream.is_null() {
+        return false;
+    }
+    let client = make_client(env, stream_events, client_cb, client_ctx);
+    env.objc
+        .borrow_mut::<CFReadStreamHostObject>(stream)
+        .client = client;
+    if client.is_none() {
+        forget_stream(stream);
+    }
     true
 }
 
 fn CFWriteStreamSetClient(
-    _env: &mut Environment,
-    _stream: CFWriteStreamRef,
-    _stream_events: CFStreamEventType,
-    _client_cb: MutVoidPtr,
-    _client_ctx: MutVoidPtr,
+    env: &mut Environment,
+    stream: CFWriteStreamRef,
+    stream_events: CFStreamEventType,
+    client_cb: GuestFunction,
+    client_ctx: MutVoidPtr,
 ) -> bool {
+    if stream.is_null() {
+        return false;
+    }
+    let client = make_client(env, stream_events, client_cb, client_ctx);
+    env.objc
+        .borrow_mut::<CFWriteStreamHostObject>(stream)
+        .client = client;
+    if client.is_none() {
+        forget_stream(stream);
+    }
     true
 }
 
 fn CFReadStreamScheduleWithRunLoop(
-    _env: &mut Environment,
-    _stream: CFReadStreamRef,
+    env: &mut Environment,
+    stream: CFReadStreamRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFStringRef,
 ) {
-    log_dbg!("CFReadStreamScheduleWithRunLoop: stubbed");
+    if stream.is_null() {
+        return;
+    }
+    env.objc
+        .borrow_mut::<CFReadStreamHostObject>(stream)
+        .scheduled = true;
+    remember_stream(stream, true);
 }
 
 fn CFReadStreamUnscheduleFromRunLoop(
-    _env: &mut Environment,
-    _stream: CFReadStreamRef,
+    env: &mut Environment,
+    stream: CFReadStreamRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFStringRef,
 ) {
-    log_dbg!("CFReadStreamUnscheduleFromRunLoop: stubbed");
+    if stream.is_null() {
+        return;
+    }
+    env.objc
+        .borrow_mut::<CFReadStreamHostObject>(stream)
+        .scheduled = false;
+    forget_stream(stream);
 }
 
 fn CFWriteStreamScheduleWithRunLoop(
-    _env: &mut Environment,
-    _stream: CFWriteStreamRef,
+    env: &mut Environment,
+    stream: CFWriteStreamRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFStringRef,
 ) {
-    log_dbg!("CFWriteStreamScheduleWithRunLoop: stubbed");
+    if stream.is_null() {
+        return;
+    }
+    env.objc
+        .borrow_mut::<CFWriteStreamHostObject>(stream)
+        .scheduled = true;
+    remember_stream(stream, false);
 }
 
 fn CFWriteStreamUnscheduleFromRunLoop(
-    _env: &mut Environment,
-    _stream: CFWriteStreamRef,
+    env: &mut Environment,
+    stream: CFWriteStreamRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFStringRef,
 ) {
-    log_dbg!("CFWriteStreamUnscheduleFromRunLoop: stubbed");
+    if stream.is_null() {
+        return;
+    }
+    env.objc
+        .borrow_mut::<CFWriteStreamHostObject>(stream)
+        .scheduled = false;
+    forget_stream(stream);
+}
+
+/// Tell the client of each scheduled stream what has happened to it. Called
+/// once per iteration of the main run loop, which is where the real API
+/// delivers these.
+pub fn deliver_pending_events(env: &mut Environment) {
+    // Copied out before any guest code runs: a callback is free to schedule,
+    // unschedule or release a stream, all of which touch this list.
+    let scheduled: Vec<(CFTypeRef, bool)> = match SCHEDULED_STREAMS.lock() {
+        Ok(scheduled) if !scheduled.is_empty() => scheduled.clone(),
+        _ => return,
+    };
+    for (stream, is_read) in scheduled {
+        if is_read {
+            deliver_read_stream_event(env, stream);
+        } else {
+            deliver_write_stream_event(env, stream);
+        }
+    }
+}
+
+/// The event a stream owes its client next, given what it is and what it has
+/// already said. `None` means there is nothing to say right now.
+fn next_read_stream_event(host: &CFReadStreamHostObject) -> Option<CFStreamEventType> {
+    if host.status == kCFStreamStatusNotOpen || host.status == kCFStreamStatusClosed {
+        // Nothing is reported before the stream is opened, or after it is
+        // closed.
+        None
+    } else if host.network {
+        // A connection touchHLE never made. Reporting the failure is what
+        // sends the app down the offline path it already has.
+        (host.delivered & kCFStreamEventErrorOccurred == 0).then_some(kCFStreamEventErrorOccurred)
+    } else if host.delivered & kCFStreamEventOpenCompleted == 0 {
+        Some(kCFStreamEventOpenCompleted)
+    } else if host.offset < host.data.len() {
+        // Not one-shot: the real API re-signals this for as long as there is
+        // something to read.
+        Some(kCFStreamEventHasBytesAvailable)
+    } else {
+        (host.delivered & kCFStreamEventEndEncountered == 0).then_some(kCFStreamEventEndEncountered)
+    }
+}
+
+fn deliver_read_stream_event(env: &mut Environment, stream: CFReadStreamRef) {
+    let host = env.objc.borrow::<CFReadStreamHostObject>(stream);
+    let (Some(client), true) = (host.client, host.scheduled) else {
+        return;
+    };
+    let Some(event) = next_read_stream_event(host) else {
+        return;
+    };
+
+    let host = env.objc.borrow_mut::<CFReadStreamHostObject>(stream);
+    host.delivered |= event;
+    match event {
+        kCFStreamEventErrorOccurred => host.status = kCFStreamStatusError,
+        kCFStreamEventEndEncountered => host.status = kCFStreamStatusAtEnd,
+        _ => (),
+    }
+    if event & client.events == 0 {
+        // The client did not ask to hear about this one.
+        return;
+    }
+
+    if event == kCFStreamEventErrorOccurred {
+        log!(
+            "CFReadStream {:?}: telling its client the connection failed, because touchHLE has no \
+             network stack",
+            stream
+        );
+    }
+    <GuestFunction as CallFromHost<(), (CFReadStreamRef, CFStreamEventType, MutVoidPtr)>>::
+        call_from_host(&client.callback, env, (stream, event, client.info));
+}
+
+fn next_write_stream_event(host: &CFWriteStreamHostObject) -> Option<CFStreamEventType> {
+    if host.status == kCFStreamStatusNotOpen || host.status == kCFStreamStatusClosed {
+        None
+    } else if host.network {
+        (host.delivered & kCFStreamEventErrorOccurred == 0).then_some(kCFStreamEventErrorOccurred)
+    } else if host.delivered & kCFStreamEventOpenCompleted == 0 {
+        Some(kCFStreamEventOpenCompleted)
+    } else {
+        // A stream writing into memory always has room for more.
+        Some(kCFStreamEventCanAcceptBytes)
+    }
+}
+
+fn deliver_write_stream_event(env: &mut Environment, stream: CFWriteStreamRef) {
+    let host = env.objc.borrow::<CFWriteStreamHostObject>(stream);
+    let (Some(client), true) = (host.client, host.scheduled) else {
+        return;
+    };
+    let Some(event) = next_write_stream_event(host) else {
+        return;
+    };
+
+    let host = env.objc.borrow_mut::<CFWriteStreamHostObject>(stream);
+    host.delivered |= event;
+    if event == kCFStreamEventErrorOccurred {
+        host.status = kCFStreamStatusError;
+    }
+    if event & client.events == 0 {
+        return;
+    }
+
+    if event == kCFStreamEventErrorOccurred {
+        log!(
+            "CFWriteStream {:?}: telling its client the connection failed, because touchHLE has no \
+             network stack",
+            stream
+        );
+    }
+    <GuestFunction as CallFromHost<(), (CFWriteStreamRef, CFStreamEventType, MutVoidPtr)>>::
+        call_from_host(&client.callback, env, (stream, event, client.info));
 }
 
 fn CFStreamCreatePairWithSocketToCFHost(
@@ -736,11 +1017,11 @@ fn CFStreamCreatePairWithSocketToCFHost(
     );
 
     if !read_stream.is_null() {
-        let rs = alloc_read_stream(env);
+        let rs = alloc_network_read_stream(env);
         env.mem.write(read_stream, rs);
     }
     if !write_stream.is_null() {
-        let ws = alloc_write_stream(env);
+        let ws = alloc_network_write_stream(env);
         env.mem.write(write_stream, ws);
     }
 }
