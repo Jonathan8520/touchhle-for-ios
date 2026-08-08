@@ -347,7 +347,11 @@ fn alloc_read_stream(env: &mut Environment) -> CFReadStreamRef {
 
 /// Like [alloc_read_stream], but for a stream standing in for a network
 /// connection touchHLE cannot make.
-fn alloc_network_read_stream(env: &mut Environment) -> CFReadStreamRef {
+///
+/// Once opened it reports `kCFStreamEventErrorOccurred` to its client and
+/// answers `ENETDOWN` when asked why, rather than sitting there looking like a
+/// reply that has not arrived yet.
+pub fn alloc_network_read_stream(env: &mut Environment) -> CFReadStreamRef {
     alloc_read_stream_inner(env, true)
 }
 

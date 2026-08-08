@@ -21,87 +21,38 @@
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_foundation::cf_array::CFArrayRef;
 use crate::frameworks::core_foundation::cf_dictionary::CFDictionaryRef;
+use crate::frameworks::core_foundation::cf_stream::{alloc_network_read_stream, CFReadStreamRef};
 use crate::frameworks::core_foundation::CFTypeRef;
 use crate::frameworks::foundation::ns_array;
 use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
 use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::mem::MutPtr;
-use crate::objc::{id, msg_class};
+use crate::objc::{id, msg_class, nil};
 use crate::Environment;
 
-const DUMMY_STREAM: u32 = 0xC0F0_0001;
-
-fn CFReadStreamCreateForHTTPRequest(_env: &mut Environment, _alloc: u32, _request: u32) -> u32 {
-    // Return a non-null dummy handle so callers that only check for null
-    // continue past the nil check.
-    DUMMY_STREAM
+/// `CFReadStreamRef CFReadStreamCreateForHTTPRequest(CFAllocatorRef, CFHTTPMessageRef)`
+///
+/// This used to hand back a made-up non-null handle so that a caller which
+/// only nil-checks the result would carry on. It carried on into
+/// CoreFoundation's real `CFReadStream*` functions, which expect a stream
+/// object and not a number. Return an actual stream instead — one that
+/// reports the connection as failed, which is the truth here and is what a
+/// caller waiting on its client callback needs to hear.
+fn CFReadStreamCreateForHTTPRequest(
+    env: &mut Environment,
+    _alloc: CFTypeRef,
+    _request: CFTypeRef,
+) -> CFReadStreamRef {
+    log!(
+        "CFReadStreamCreateForHTTPRequest: returning a stream that will report the connection as \
+         failed, because touchHLE has no network stack"
+    );
+    alloc_network_read_stream(env)
 }
 
-fn CFReadStreamOpen(_env: &mut Environment, _stream: u32) -> bool {
-    true
-}
-
-fn CFReadStreamHasBytesAvailable(_env: &mut Environment, _stream: u32) -> bool {
-    false
-}
-
-fn CFReadStreamRead(
-    _env: &mut Environment,
-    _stream: u32,
-    _buffer: MutPtr<u8>,
-    _buffer_length: i32,
-) -> i32 {
-    0
-}
-
-fn CFReadStreamClose(_env: &mut Environment, _stream: u32) {}
-
-fn CFReadStreamSetProperty(
-    _env: &mut Environment,
-    _stream: u32,
-    _property: u32,
-    _value: u32,
-) -> bool {
-    true
-}
-
-fn CFReadStreamCopyProperty(_env: &mut Environment, _stream: u32, _property: u32) -> u32 {
-    0
-}
-
-fn CFReadStreamScheduleWithRunLoop(
-    _env: &mut Environment,
-    _stream: u32,
-    _run_loop: u32,
-    _run_loop_mode: u32,
-) {
-}
-
-fn CFReadStreamUnscheduleFromRunLoop(
-    _env: &mut Environment,
-    _stream: u32,
-    _run_loop: u32,
-    _run_loop_mode: u32,
-) {
-}
-
-fn CFReadStreamSetClient(
-    _env: &mut Environment,
-    _stream: u32,
-    _callback_types: u32,
-    _client_cb: u32,
-    _client_context: u32,
-) -> bool {
-    true
-}
-
-fn CFReadStreamGetStatus(_env: &mut Environment, _stream: u32) -> u32 {
-    // kCFStreamStatusOpen
-    2
-}
-
-fn CFReadStreamCopyError(_env: &mut Environment, _stream: u32) -> u32 {
-    0
+fn CFReadStreamCopyError(_env: &mut Environment, _stream: CFReadStreamRef) -> CFTypeRef {
+    // A CFErrorRef. CFReadStreamGetError, which CoreFoundation exports, is
+    // the one that answers with something specific.
+    nil
 }
 
 /// `CFDictionaryRef CFNetworkCopySystemProxySettings(void)`
