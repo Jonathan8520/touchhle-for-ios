@@ -33,12 +33,54 @@ struct FILEHostObject {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-/// C `FILE` struct. This is an opaque type in C, so the definition here is our
-/// own.
+/// C `FILE`.
+///
+/// `FILE` is opaque in C, but it is not opaque to an app compiled against the
+/// iOS SDK: `<stdio.h>` defines `feof`, `ferror`, `clearerr`, `fileno`, `getc`
+/// and `putc` as macros that reach into `struct __sFILE` directly. `getc` is
+/// `(--(p)->_r < 0 ? __srget(p) : *(p)->_p++)`, which *writes* four bytes in.
+///
+/// This used to be four bytes long, so every one of those touched whatever the
+/// app had allocated after it. It is now the size the SDK believes it is, with
+/// the fields those macros use where they expect them, so the reads and writes
+/// land inside the block that was allocated for them.
+///
+/// `_r` and `_w` are left at zero, which sends `getc`/`putc` down their slow
+/// path into `___srget` / `___swbuf` — the functions this module exports — on
+/// every call, rather than through a buffer this `FILE` does not have.
+#[repr(C)]
 struct FILE {
+    /// The descriptor. Sits at offset 0, where `__sFILE::_p` lives; the `getc`
+    /// fast path that would dereference it is never taken, and `___sF` users
+    /// expect the fd here (see [CONSTANTS]).
     fd: posix_io::FileDescriptor,
+    /// `__sFILE::_r` and `_w`: bytes left in the read and write buffers.
+    _r_and_w: [u8; 8],
+    /// `__sFILE::_flags`. `__SEOF`/`__SERR` live here, so the macro forms of
+    /// `feof`/`ferror` read this rather than calling into this module. Left at
+    /// zero: they answer "no", where the function forms answer correctly.
+    _flags: i16,
+    /// `__sFILE::_file`, which is where `fileno()` reads the descriptor from.
+    file: i16,
+    /// The rest of `struct __sFILE`. Nothing in the SDK's macros reads it, but
+    /// it is part of the size an app allocates and copies.
+    _rest: [u8; DARWIN_SFILE_SIZE as usize - 16],
 }
 unsafe impl SafeRead for FILE {}
+
+impl FILE {
+    fn new(fd: posix_io::FileDescriptor) -> Self {
+        FILE {
+            fd,
+            _r_and_w: [0; 8],
+            _flags: 0,
+            // A descriptor never gets near i16::MAX here, but saturate rather
+            // than wrap: a wrapped one would be a plausible-looking wrong fd.
+            file: i16::try_from(fd).unwrap_or(i16::MAX),
+            _rest: [0; DARWIN_SFILE_SIZE as usize - 16],
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct State {
@@ -74,7 +116,7 @@ impl State {
         //    and let the surrounding code report errors via `errno` /
         //    `ferror()` if the underlying `fd` turns out to be invalid.
         self.file_streams.entry(file_ptr).or_insert_with(|| {
-            let FILE { fd } = mem.read(file_ptr);
+            let FILE { fd, .. } = mem.read(file_ptr);
             if !matches!(fd, STDIN_FILENO | STDOUT_FILENO | STDERR_FILENO) {
                 log!(
                     "Warning: stdio host object for FILE* {:?} (fd {}) was \
@@ -149,7 +191,7 @@ fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> M
     match posix_io::open_direct(env, filename, flags) {
         -1 => Ptr::null(),
         fd => {
-            let res = env.mem.alloc_and_write(FILE { fd });
+            let res = env.mem.alloc_and_write(FILE::new(fd));
             // Без заглушек: игры часто грешат тем, что вызывают free() на
             // указатель FILE*,
             // минуя вызов fclose(). В результате память освобождается,
@@ -183,7 +225,7 @@ fn freopen(
     }
 
     // 1. Сбрасываем буфер и закрываем старый дескриптор
-    let FILE { fd: old_fd } = env.mem.read(stream);
+    let FILE { fd: old_fd, .. } = env.mem.read(stream);
     let _ = posix_io::fflush(env, old_fd);
     let _ = posix_io::close(env, old_fd);
 
@@ -247,7 +289,7 @@ fn freopen(
 
     // 4. Связываем новый дескриптор со старым потоком
     // В памяти гостя перезаписываем структуру FILE
-    env.mem.write(stream, FILE { fd: new_fd });
+    env.mem.write(stream, FILE::new(new_fd));
 
     log_dbg!(
         "freopen() successfully reopened fd {} as new fd {} for stream {:?}",
@@ -304,7 +346,7 @@ fn fread(
     } else {
         0
     };
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     match posix_io::read(env, fd, buffer, total_size) {
         -1 => {
             env.libc_state
@@ -324,7 +366,7 @@ fn fgetc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     let FILEHostObject {
         ref mut pushbacks, ..
     } = env
@@ -366,7 +408,7 @@ fn getc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
 
 fn ungetc(env: &mut Environment, c: i32, file_ptr: MutPtr<FILE>) -> i32 {
     assert!(c != EOF); // TODO
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     let curr_offset = posix_io::lseek(env, fd, 0, SEEK_CUR);
     assert!(curr_offset > 0);
     // Note: successful seeking clears EOF indicator
@@ -389,9 +431,17 @@ fn fgets(
     size: GuestUSize,
     stream: MutPtr<FILE>,
 ) -> MutPtr<u8> {
+    // C99 §7.19.7.2: at most `size - 1` characters are read, and the array is
+    // always terminated within itself. Reading `size` of them and then writing
+    // the terminator at `str[size]` put a NUL one byte past the caller's
+    // buffer — a heap overwrite the guest has no way to see coming, and one
+    // that lands on whatever the app allocated next.
+    if size == 0 {
+        return Ptr::null();
+    }
     let mut read = 0;
     let mut tmp = str;
-    while read < size && fread(env, tmp.cast(), 1, 1, stream) != 0 {
+    while read < size - 1 && fread(env, tmp.cast(), 1, 1, stream) != 0 {
         tmp += 1;
         read += 1;
         if env.mem.read(tmp - 1) == b'\n' {
@@ -451,7 +501,7 @@ fn fwrite(
         return 0;
     }
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
 
     let total_size = item_size.checked_mul(n_items).unwrap();
 
@@ -509,7 +559,7 @@ fn fseeko(env: &mut Environment, file_ptr: MutPtr<FILE>, offset: off_t, whence: 
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
 
     assert!([SEEK_SET, SEEK_CUR, SEEK_END].contains(&whence));
     match posix_io::lseek(env, fd, offset, whence) {
@@ -535,7 +585,7 @@ fn ftello(env: &mut Environment, file_ptr: MutPtr<FILE>) -> off_t {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR)
 }
 
@@ -568,7 +618,7 @@ fn fclose(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
         .stdio
         .get_file_host_obj_mut(&mut env.mem, file_ptr);
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     if matches!(fd, STDIN_FILENO | STDOUT_FILENO | STDERR_FILENO) {
         log!(
             "Warning! fclose({:?}) is called for standard descriptor {}.",
@@ -629,7 +679,7 @@ fn fsetpos(env: &mut Environment, file_ptr: MutPtr<FILE>, pos: ConstPtr<fpos_t>)
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
 
     let res = posix_io::lseek(env, fd, env.mem.read(pos), SEEK_SET);
     if res == -1 {
@@ -650,7 +700,7 @@ fn fgetpos(env: &mut Environment, file_ptr: MutPtr<FILE>, pos: MutPtr<fpos_t>) -
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
 
     let res = posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR);
     if res == -1 {
@@ -664,7 +714,7 @@ fn feof(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     posix_io::eof(env, fd)
 }
 
@@ -677,7 +727,7 @@ fn clearerr(env: &mut Environment, file_ptr: MutPtr<FILE>) {
         .get_file_host_obj_mut(&mut env.mem, file_ptr)
         .error = false;
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     posix_io::clearerr(env, fd)
 }
 
@@ -685,7 +735,7 @@ fn fflush(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     posix_io::fflush(env, fd)
 }
 
@@ -826,7 +876,7 @@ fn setvbuf(
 // POSIX-specific functions
 
 fn fileno(env: &mut Environment, file_ptr: MutPtr<FILE>) -> posix_io::FileDescriptor {
-    let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd, .. } = env.mem.read(file_ptr);
     fd
 }
 
@@ -869,7 +919,7 @@ pub const CONSTANTS: ConstantExports = &[
     (
         "___stdinp",
         HostConstant::Custom(|env| -> ConstVoidPtr {
-            let ptr = env.mem.alloc_and_write(FILE { fd: STDIN_FILENO });
+            let ptr = env.mem.alloc_and_write(FILE::new(STDIN_FILENO));
             // Note: Host object would be created lazily
             env.mem.alloc_and_write(ptr).cast().cast_const()
         }),
@@ -877,7 +927,7 @@ pub const CONSTANTS: ConstantExports = &[
     (
         "___stdoutp",
         HostConstant::Custom(|env| -> ConstVoidPtr {
-            let ptr = env.mem.alloc_and_write(FILE { fd: STDOUT_FILENO });
+            let ptr = env.mem.alloc_and_write(FILE::new(STDOUT_FILENO));
             // Note: Host object would be created lazily
             env.mem.alloc_and_write(ptr).cast().cast_const()
         }),
@@ -885,7 +935,7 @@ pub const CONSTANTS: ConstantExports = &[
     (
         "___stderrp",
         HostConstant::Custom(|env| -> ConstVoidPtr {
-            let ptr = env.mem.alloc_and_write(FILE { fd: STDERR_FILENO });
+            let ptr = env.mem.alloc_and_write(FILE::new(STDERR_FILENO));
             // Note: Host object would be created lazily
             env.mem.alloc_and_write(ptr).cast().cast_const()
         }),

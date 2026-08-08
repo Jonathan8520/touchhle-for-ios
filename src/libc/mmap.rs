@@ -7,7 +7,7 @@
 use crate::dyld::FunctionExports;
 use crate::environment::Environment;
 use crate::export_c_func;
-use crate::libc::errno::{set_errno, EIO, EINVAL, ENOTSUP};
+use crate::libc::errno::{set_errno, EINVAL, EIO, ENOMEM};
 use crate::libc::posix_io;
 use crate::libc::posix_io::{off_t, open_direct, FileDescriptor, SEEK_SET};
 use crate::mem::{ConstPtr, GuestUSize, MutVoidPtr, PAGE_SIZE_ALIGN_MASK};
@@ -16,6 +16,11 @@ use std::collections::HashMap;
 #[allow(dead_code)]
 const MAP_FILE: i32 = 0x0000;
 const MAP_ANON: i32 = 0x1000;
+
+/// What `mmap` returns when it fails. Not NULL: a caller that checks for NULL
+/// instead is the one making the mistake, but a caller that correctly checks
+/// for `MAP_FAILED` and is handed NULL goes on to read from address zero.
+const MAP_FAILED: u32 = 0xFFFF_FFFF;
 
 #[derive(Default)]
 pub struct State {
@@ -48,6 +53,16 @@ fn mmap(
 
     // TODO: use vm_allocate() instead
     let ptr = env.mem.calloc(len);
+    if ptr.is_null() {
+        // Handing back NULL here told a caller checking against MAP_FAILED
+        // that the mapping had succeeded, and it then read from address zero.
+        log!(
+            "Warning: mmap: could not allocate {} bytes for the mapping; returning MAP_FAILED",
+            len
+        );
+        set_errno(env, ENOMEM);
+        return MutVoidPtr::from_bits(MAP_FAILED);
+    }
 
     if (flags & MAP_ANON) != 0 {
         assert!(ptr.to_bits() & PAGE_SIZE_ALIGN_MASK == 0);
@@ -83,8 +98,15 @@ fn mmap(
                 ptr
             );
         }
+        // mmap(2) does not disturb the descriptor's file offset, so whatever
+        // the guest had set is put back before returning. Reading the file
+        // through the descriptor is this implementation's own business, and
+        // an app that mmaps a region and then carries on read()ing from where
+        // it was should not find itself somewhere else.
+        let saved_offset = posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR);
+
         // Seek to the requested offset. If the seek fails (e.g. bad fd),
-        // return MAP_FAILED (-1 as pointer) instead of crashing.
+        // return MAP_FAILED instead of crashing.
         let new_offset = posix_io::lseek(env, fd, offset, SEEK_SET);
         if new_offset != offset {
             log!(
@@ -93,11 +115,26 @@ fn mmap(
             );
             env.mem.free(ptr);
             set_errno(env, EIO);
-            return MutVoidPtr::from_bits(0xFFFFFFFF); // MAP_FAILED
+            return MutVoidPtr::from_bits(MAP_FAILED);
         }
 
         let read = posix_io::read(env, fd, ptr, len);
-        if (read as u32) < len {
+        if saved_offset >= 0 {
+            posix_io::lseek(env, fd, saved_offset, SEEK_SET);
+        }
+        if read < 0 {
+            // `(read as u32) < len` said no: -1 becomes 4294967295, so a read
+            // that failed outright looked like one that had filled the whole
+            // mapping, and the guest got a page of zeros with no way to tell.
+            log!(
+                "Warning: mmap: read from fd {} failed; returning MAP_FAILED",
+                fd
+            );
+            env.mem.free(ptr);
+            set_errno(env, EIO);
+            return MutVoidPtr::from_bits(MAP_FAILED);
+        }
+        if (read as GuestUSize) < len {
             log!(
                 "Warning: mmap: read only {} of {} bytes from fd {}; padding remainder with zeros",
                 read, len, fd
@@ -145,9 +182,14 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
 }
 
 fn madvise(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize, advice: i32) -> i32 {
-    log!("TODO: madvise({:?}, {}, {}) -> -1", addr, len, advice);
-    set_errno(env, ENOTSUP);
-    -1
+    // Advice, as the name says: Darwin is free to do nothing with it and
+    // still report success, and it does for most values. Failing instead told
+    // an app that something was wrong with a mapping that is perfectly fine —
+    // and an asset loader that treats a failed madvise as a failed mapping
+    // gives up over nothing.
+    log_dbg!("madvise({:?}, {}, {}) -> 0 (ignored)", addr, len, advice);
+    set_errno(env, 0);
+    0
 }
 
 fn shm_open(env: &mut Environment, name: ConstPtr<u8>, oflag: i32, mode: u32) -> i32 {

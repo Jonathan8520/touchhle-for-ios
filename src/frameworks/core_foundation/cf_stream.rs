@@ -597,22 +597,23 @@ fn packed_stream_error(domain: CFStreamErrorDomain, error: i32) -> u64 {
     ((domain as u32 as u64) & 0xFFFF_FFFF) | ((error as u32 as u64) << 32)
 }
 
-/// What a stream that stood in for a connection touchHLE could not make
-/// reports when asked why it failed. `ENETDOWN` is the honest answer, and the
-/// same one `SCNetworkReachability` gives.
-const ENETDOWN: i32 = 50;
+// These two return `CFStreamError`, a composite type larger than one word.
+// AAPCS returns one of those indirectly: the caller passes the address of the
+// result buffer in r0 and every declared argument shifts up one register, so
+// the `stream` these are handed is the buffer pointer, not the stream. touchHLE
+// does not model that convention here, which makes the argument unusable — an
+// attempt to tell a failed network stream apart from a working file one read
+// the buffer pointer as an object and looked it up in the ObjC world.
+//
+// Answering without looking at the argument is all that can be done until the
+// indirect-result convention is modelled. `CFReadStreamGetStatus` says whether
+// a stream failed, and the client callback says so too; this only says why.
 
-fn CFReadStreamGetError(env: &mut Environment, stream: CFReadStreamRef) -> u64 {
-    if !stream.is_null() && env.objc.borrow::<CFReadStreamHostObject>(stream).network {
-        return packed_stream_error(kCFStreamErrorDomainPOSIX, ENETDOWN);
-    }
+fn CFReadStreamGetError(_env: &mut Environment, _stream: CFReadStreamRef) -> u64 {
     packed_stream_error(kCFStreamErrorDomainCustom, -1)
 }
 
-fn CFWriteStreamGetError(env: &mut Environment, stream: CFWriteStreamRef) -> u64 {
-    if !stream.is_null() && env.objc.borrow::<CFWriteStreamHostObject>(stream).network {
-        return packed_stream_error(kCFStreamErrorDomainPOSIX, ENETDOWN);
-    }
+fn CFWriteStreamGetError(_env: &mut Environment, _stream: CFWriteStreamRef) -> u64 {
     packed_stream_error(kCFStreamErrorDomainCustom, -1)
 }
 
@@ -675,7 +676,12 @@ fn CFWriteStreamWrite(
     if host.status != kCFStreamStatusOpen && host.status != kCFStreamStatusWriting {
         return -1;
     }
+    // The real API signals a scheduled client that the stream can take more
+    // after each write, so clear the "already said so" bit for the next turn
+    // of the run loop. See next_write_stream_event.
+    host.delivered &= !kCFStreamEventCanAcceptBytes;
     let bytes = env.mem.bytes_at(buffer, buffer_length as u32);
+    let host = env.objc.borrow_mut::<CFWriteStreamHostObject>(stream);
     host.data.extend_from_slice(bytes);
     buffer_length
 }
@@ -792,11 +798,16 @@ fn CFReadStreamSetClient(
         return false;
     }
     let client = make_client(env, stream_events, client_cb, client_ctx);
-    env.objc
-        .borrow_mut::<CFReadStreamHostObject>(stream)
-        .client = client;
-    if client.is_none() {
-        forget_stream(stream);
+    let host = env.objc.borrow_mut::<CFReadStreamHostObject>(stream);
+    host.client = client;
+    let scheduled = host.scheduled;
+    match (client.is_some(), scheduled) {
+        // A client set after the stream was scheduled is still owed its
+        // events; dropping the stream from the list when the client was
+        // cleared must not make it unreachable for good.
+        (true, true) => remember_stream(stream, true),
+        (false, _) => forget_stream(stream),
+        _ => (),
     }
     true
 }
@@ -812,11 +823,14 @@ fn CFWriteStreamSetClient(
         return false;
     }
     let client = make_client(env, stream_events, client_cb, client_ctx);
-    env.objc
-        .borrow_mut::<CFWriteStreamHostObject>(stream)
-        .client = client;
-    if client.is_none() {
-        forget_stream(stream);
+    let host = env.objc.borrow_mut::<CFWriteStreamHostObject>(stream);
+    host.client = client;
+    let scheduled = host.scheduled;
+    match (client.is_some(), scheduled) {
+        // See CFReadStreamSetClient.
+        (true, true) => remember_stream(stream, false),
+        (false, _) => forget_stream(stream),
+        _ => (),
     }
     true
 }
@@ -892,11 +906,25 @@ pub fn deliver_pending_events(env: &mut Environment) {
         _ => return,
     };
     for (stream, is_read) in scheduled {
+        // One callback can release a different stream in this same pass, and
+        // a released stream's dealloc takes it off the list. Re-checking here
+        // is what stops the rest of the snapshot from reaching an object that
+        // no longer exists.
+        if !is_still_scheduled(stream) {
+            continue;
+        }
         if is_read {
             deliver_read_stream_event(env, stream);
         } else {
             deliver_write_stream_event(env, stream);
         }
+    }
+}
+
+fn is_still_scheduled(stream: CFTypeRef) -> bool {
+    match SCHEDULED_STREAMS.lock() {
+        Ok(scheduled) => scheduled.iter().any(|&(s, _)| s == stream),
+        Err(_) => false,
     }
 }
 
@@ -962,8 +990,12 @@ fn next_write_stream_event(host: &CFWriteStreamHostObject) -> Option<CFStreamEve
     } else if host.delivered & kCFStreamEventOpenCompleted == 0 {
         Some(kCFStreamEventOpenCompleted)
     } else {
-        // A stream writing into memory always has room for more.
-        Some(kCFStreamEventCanAcceptBytes)
+        // A stream writing into memory always has room for more, but saying so
+        // on every turn of the run loop would be a callback per frame forever.
+        // The real API signals once and again after each write, which is what
+        // CFWriteStreamWrite re-arms.
+        (host.delivered & kCFStreamEventCanAcceptBytes == 0)
+            .then_some(kCFStreamEventCanAcceptBytes)
     }
 }
 
