@@ -607,7 +607,25 @@ pub fn total_bytes_read() -> u64 {
 /// directly than a guest address does.
 static OPENS: std::sync::Mutex<Option<(u64, u64, String)>> = std::sync::Mutex::new(None);
 
+/// How many of the most recent opens [recent_opens] remembers.
+///
+/// One path names the subsystem; the run-up to it names the step. An asset
+/// system that reads an index, walks into a package and then stops has a very
+/// different shape from one that never found its index at all, and the two are
+/// indistinguishable from a single filename.
+const RECENT_OPENS: usize = 24;
+
+static RECENT: std::sync::Mutex<std::collections::VecDeque<(bool, String)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
 fn record_open(path: &GuestPath, working_directory: &GuestPath, succeeded: bool) {
+    if let Ok(mut recent) = RECENT.lock() {
+        if recent.len() == RECENT_OPENS {
+            recent.pop_front();
+        }
+        recent.push_back((succeeded, path.as_str().to_string()));
+    }
+
     let Ok(mut opens) = OPENS.lock() else {
         return;
     };
@@ -623,6 +641,20 @@ fn record_open(path: &GuestPath, working_directory: &GuestPath, succeeded: bool)
     if !succeeded {
         report_open_failed(path, working_directory);
     }
+}
+
+/// The last few paths the guest opened, oldest first, each marked with whether
+/// it was there. See [RECENT_OPENS].
+pub fn recent_opens() -> Vec<String> {
+    let Ok(recent) = RECENT.lock() else {
+        return Vec::new();
+    };
+    recent
+        .iter()
+        .map(|(succeeded, path)| {
+            format!("{}{}", if *succeeded { "" } else { "!" }, path)
+        })
+        .collect()
 }
 
 /// Find a directory entry whose name differs from `wanted` only in case.

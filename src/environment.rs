@@ -1696,6 +1696,16 @@ impl Environment {
                 busiest.join(", ")
             );
         }
+        // The run-up to the last file says what step the app was on. A `!`
+        // marks a path that was not there.
+        let recent = crate::fs::recent_opens();
+        if !recent.is_empty() {
+            log!(
+                "guest sample at {:.0}s: last files opened: {}",
+                elapsed,
+                recent.join(" ")
+            );
+        }
     }
 
     pub fn run(mut self) {
