@@ -1701,36 +1701,27 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id, drawable: id)
         );
         crate::matrix::Matrix::<2>::identity()
     } else if is_ios_es2_override_path {
-        // Composition would have applied the layer's own transform, and the
-        // frame comes out a quarter turn wrong without it. Reproducing that
-        // transform is not a guess about what looks right: it is the same
-        // rotation, read from the same layer.
-        match layer_rotation(env, drawable) {
-            Some(angle) => {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static REPORTED: AtomicBool = AtomicBool::new(false);
-                if !REPORTED.swap(true, Ordering::Relaxed) {
-                    log!(
-                        "iOS ES2 direct presenter: applying the {:.0}° rotation the \
-                         drawable layer carries, which composition would have \
-                         applied. Pass --present-rotation= to override it. \
-                         [this log will only be shown once]",
-                        angle.to_degrees()
-                    );
-                }
-                // The matrix rotates texture co-ordinates, so displaying the
-                // image rotated by the layer's angle means rotating the
-                // co-ordinates by its negation.
-                crate::matrix::Matrix::<2>::z_rotation(-angle)
-            }
-            None => {
-                log_once!(
-                    "iOS ES2 direct presenter: the drawable layer does not rotate, \
-                     presenting the guest frame as drawn."
+        // Composition applies the drawable layer's own transform, so
+        // reproducing it here looked like the principled thing to do. On a
+        // real iPhone it is wrong: the frame comes out a quarter turn the
+        // other way from where it belongs. The guest frame is presented as
+        // drawn, and the angle the layer carries is reported for anyone
+        // reading a log, because knowing it is what --present-rotation= is
+        // set from.
+        if let Some(angle) = layer_rotation(env, drawable) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                log!(
+                    "iOS ES2 direct presenter: the drawable layer carries a {:.0}° \
+                     rotation, which is NOT applied — on a device that puts the \
+                     picture a quarter turn out. Pass --present-rotation= to \
+                     rotate it. [this log will only be shown once]",
+                    angle.to_degrees()
                 );
-                crate::matrix::Matrix::<2>::identity()
             }
         }
+        crate::matrix::Matrix::<2>::identity()
     } else if needs_autorotation_compensation {
         env.window
             .as_mut()
