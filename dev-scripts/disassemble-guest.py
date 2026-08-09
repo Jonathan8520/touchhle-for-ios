@@ -13,6 +13,7 @@ target, and is honoured here.
 Usage:
     dev-scripts/disassemble-guest.py <app.ipa | Foo.app | Mach-O> <address>...
     dev-scripts/disassemble-guest.py --xref <app.ipa | ...> <address>...
+    dev-scripts/disassemble-guest.py --field <app.ipa | ...> <offset>...
     dev-scripts/disassemble-guest.py --callchain <app.ipa | ...> <address> [depth]
     dev-scripts/disassemble-guest.py --class <app.ipa | ...> <name>...
     dev-scripts/disassemble-guest.py --class-list <app.ipa | ...>
@@ -32,6 +33,15 @@ when you do not yet know what to ask for.
 form a data address, and reports each site that forms one of the given
 addresses, saying whether it goes on to read it or write it. That is how
 you find who is supposed to fill in a global that turned out to be zero.
+
+`--field` asks the same question about a *field* rather than a global, and
+finds what `--xref` structurally cannot. Code that writes `obj->flag` never
+forms the address of `obj`: it is handed one and writes `[r4, #0x2a8]`. So
+sweeping for the address reports nothing and the trail ends, while sweeping
+for the displacement finds every writer there is. It reports each access to
+that offset with the function it sits in, and, given several offsets, the
+functions that reach all of them — which is the question to ask when a
+decision is made out of two flags at once.
 
 `--string` starts from the words on the screen instead of from an address.
 An app that has stopped is usually showing something, and the text it shows
@@ -829,6 +839,115 @@ def callchain(capstone, data, address, depth):
     walk(address & ~1, 0)
 
 
+def field_access(capstone, data, offsets):
+    """Every instruction that reaches a struct field at one of `offsets`.
+
+    `--xref` answers "what code forms this address", which finds the code
+    that names a global. It cannot find the code that is *handed* an object
+    and writes a field of it: that code never forms the object's address, so
+    sweeping for the address truthfully reports nothing and the trail ends —
+    which is exactly what "no direct caller in the binary" means when it is
+    not the whole story.
+
+    A field is recognisable by its displacement instead. `strb r0, [r4,
+    #0x2a8]` writes offset 0x2a8 of whatever r4 points at, whoever passed it.
+    The price of not needing to know what r4 holds is that this finds the
+    accesses to *every* object's field at that offset, not only the one that
+    prompted the question; with a large offset that is usually a short list.
+
+    Given more than one offset it also reports the functions that reach all
+    of them, which is the useful question when a decision is made out of two
+    flags at once."""
+    wanted = set(offsets)
+    arm = capstone.arm
+    prologues = []
+    hits = {offset: [] for offset in offsets}
+
+    for instruction, _restarted in iter_code(capstone, data):
+        mnemonic = instruction.mnemonic
+        # Collected in the same sweep as the accesses: naming the function an
+        # access sits in is most of what makes the answer usable, and a second
+        # pass over an 8 MB __text to learn it is a minute nobody needs to
+        # spend.
+        if mnemonic.startswith("push"):
+            for operand in instruction.operands:
+                if operand.type == arm.ARM_OP_REG and operand.reg == arm.ARM_REG_LR:
+                    prologues.append(instruction.address)
+                    break
+            continue
+        if not (mnemonic.startswith("str") or mnemonic.startswith("ldr")):
+            continue
+        for operand in instruction.operands:
+            if operand.type != arm.ARM_OP_MEM:
+                continue
+            memory = operand.mem
+            # `[r4, r5]` has no fixed displacement, and `[pc, #n]` is a
+            # literal pool load — a constant, not a field of anything.
+            if memory.index != 0 or memory.base in (0, arm.ARM_REG_PC):
+                continue
+            if memory.disp in wanted:
+                hits[memory.disp].append(
+                    (
+                        instruction.address,
+                        mnemonic,
+                        instruction.op_str,
+                        "writes" if mnemonic.startswith("str") else "reads",
+                    )
+                )
+            break
+
+    prologues.sort()
+    report_field_access(data, offsets, hits, prologues)
+
+
+def report_field_access(data, offsets, hits, prologues):
+    for offset in offsets:
+        print()
+        print("=== instructions using the displacement {:#x} ===".format(offset))
+        rows = sorted(set(hits[offset]))
+        if not rows:
+            print("(none — nothing in the binary uses that displacement)")
+            continue
+        for address, mnemonic, op_str, action in rows:
+            function = containing_function(prologues, address)
+            name = symbol_for(data, address) or symbol_for(data, address | 1)
+            print(
+                "{:#010x}  {:<8} {:<26} {:<7}{}{}".format(
+                    address,
+                    mnemonic,
+                    op_str,
+                    action,
+                    "  in {:#x}".format(function) if function is not None else "",
+                    "   ({})".format(name) if name else "",
+                )
+            )
+
+    if len(set(offsets)) < 2:
+        return
+
+    print()
+    print("=== functions that reach every one of those offsets ===")
+    reached = {}
+    for offset in offsets:
+        for address, _mnemonic, _op_str, _action in hits[offset]:
+            function = containing_function(prologues, address)
+            if function is not None:
+                reached.setdefault(function, set()).add(offset)
+    both = sorted(
+        function for function, seen in reached.items() if seen == set(offsets)
+    )
+    if not both:
+        print("(none — no single function touches all of them)")
+        return
+    for function in both:
+        name = symbol_for(data, function) or symbol_for(data, function | 1)
+        print(
+            "{:#010x}   pass {:#x} to --callchain to find its callers{}".format(
+                function, function | 1, "   ({})".format(name) if name else ""
+            )
+        )
+
+
 def sweep_section(capstone, code, section, found, wanted):
     """Disassemble one section end to end, restarting where it stalls.
 
@@ -1347,6 +1466,17 @@ def main(argv):
             die("capstone is not installed (pip install capstone)")
         data = armv7_slice(find_executable(argv[2]))
         report_strings(capstone, data, argv[3:])
+        return
+
+    if argv[1:2] == ["--field"]:
+        if len(argv) < 4:
+            sys.exit(__doc__)
+        try:
+            import capstone
+        except ImportError:
+            die("capstone is not installed (pip install capstone)")
+        data = armv7_slice(find_executable(argv[2]))
+        field_access(capstone, data, [int(raw, 16) for raw in argv[3:]])
         return
 
     if argv[1:2] in (["--xref"], ["--callchain"]):

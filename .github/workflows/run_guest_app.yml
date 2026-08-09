@@ -68,6 +68,11 @@ on:
         type: string
         required: false
         default: ""
+      field:
+        description: Struct field offsets to find the code that reads or writes them, comma-separated hex
+        type: string
+        required: false
+        default: ""
       callchain:
         description: One guest address to walk upwards from, finding who calls it
         type: string
@@ -480,6 +485,26 @@ jobs:
           # shellcheck disable=SC2046
           python3 dev-scripts/disassemble-guest.py --xref downloaded_app/app.ipa \
             $(printf '%s' "$ADDRESSES" | tr ',' ' ') | tee -a disassembly.txt
+
+      # What `xref` structurally cannot find: the code that is handed an
+      # object and writes a field of it never forms the object's address.
+      - name: Find the code that reaches the given struct field offsets
+        if: ${{ always() && inputs.field != '' }}
+        env:
+          OFFSETS: ${{ inputs.field }}
+        run: |
+          set -euo pipefail
+          case "$OFFSETS" in
+            *[!0-9a-fA-FxX,\ ]*)
+              echo "Offsets must be hexadecimal, separated by commas." >&2
+              exit 2
+              ;;
+          esac
+          python3 -m pip install --quiet capstone \
+            || python3 -m pip install --quiet --break-system-packages capstone
+          # shellcheck disable=SC2046
+          python3 dev-scripts/disassemble-guest.py --field downloaded_app/app.ipa \
+            $(printf '%s' "$OFFSETS" | tr ',' ' ') | tee -a disassembly.txt
 
       # And the whole path at once, rather than one dispatch per level.
       - name: Walk the call graph upwards from the given address
