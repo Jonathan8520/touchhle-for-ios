@@ -342,11 +342,10 @@ com.disney.SwampyGame: --device-family=iphone-3gs
 # opt-in and is enabled per app here.
 com.ea.simsmedieval.bv: --ios-es2-direct-present
 
-# Disney Infinity: Toy Box 3.0 is in the same position, for the reason an iPad
-# landscape game always is: its UIWindow stays portrait (768x1024) while the
-# EAGL view inside it is landscape (1024x768), so the two sizes can never match
-# and the fullscreen-layer test can never pass. On desktop the compositor picks
-# the frame up; on a device it is lost and the screen stays black while the
-# game happily renders. The pixel sampler reports "8 distinct colours, mean
-# brightness 7/255 — something is drawn" for exactly those black frames.
+# Disney Infinity: Toy Box 3.0: an iPad landscape game that keeps a portrait
+# 768x1024 UIWindow while its CAEAGLLayer is landscape 1024x768 and carries a
+# quarter-turn transform. The fullscreen-layer fast path requires the layer's
+# bounds to equal the screen's, so this layer can never qualify, and the frame
+# falls into Core Animation composition and is lost on a device: audio plays
+# over a black screen. The direct presenter is what puts it on screen.
 com.disney.disneyinfinity3: --ios-es2-direct-present
