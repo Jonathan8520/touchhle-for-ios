@@ -1424,6 +1424,20 @@ impl Dyld {
     /// Return a host function that can be called to handle an SVC instruction
     /// encountered during CPU emulation. If `None` is returned, the execution
     /// needs to resume at `svc_pc`.
+    /// Whether this SVC is one touchHLE never handed out.
+    ///
+    /// Every SVC above [Self::SVC_LINKED_FUNCTIONS_BASE] indexes a host
+    /// function this app has linked. An index past the end of that list
+    /// belongs to nobody here — which is where a raw Darwin `svc #0x80` from
+    /// the app's own code arrives, since 128 falls inside the same range.
+    pub fn is_unhandled_svc(&self, svc: u32) -> bool {
+        if svc < Self::SVC_LINKED_FUNCTIONS_BASE {
+            return false;
+        }
+        let index = (svc & !Self::SVC_LAZY_LINK_RET_FLAG) - Self::SVC_LINKED_FUNCTIONS_BASE;
+        self.linked_host_functions.get(index as usize).is_none()
+    }
+
     pub fn get_svc_handler(
         &mut self,
         bins: &[MachO],

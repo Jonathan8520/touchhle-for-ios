@@ -85,7 +85,7 @@ enum SysInfoType {
     Bytes(&'static [u8]),
 }
 
-fn sysctl(
+pub(crate) fn sysctl(
     env: &mut Environment,
     name: MutPtr<i32>,
     name_len: u32,

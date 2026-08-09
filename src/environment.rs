@@ -2332,6 +2332,20 @@ impl Environment {
                     dyld::Dyld::SVC_LAZY_LINK
                     | dyld::Dyld::SVC_LAZY_LINK_RET_FLAG
                     | dyld::Dyld::SVC_LINKED_FUNCTIONS_BASE.. => {
+                        // Darwin's own system call instruction is `svc #0x80`,
+                        // whose number falls inside the range touchHLE hands
+                        // out for host functions. Only one with no host
+                        // function behind it can be the real thing, and that
+                        // is what this asks. The program counter is already
+                        // past the instruction, which is what a syscall does —
+                        // and not doing this left the guest re-executing it
+                        // forever.
+                        if svc == crate::libc::syscall::DARWIN_SYSCALL_SVC
+                            && self.dyld.is_unhandled_svc(svc)
+                        {
+                            crate::libc::syscall::handle_darwin_syscall(self, svc_pc);
+                            return ThreadNextAction::Continue;
+                        }
                         if let Some(f) = self.dyld.get_svc_handler(
                             &self.bins,
                             &mut self.mem,

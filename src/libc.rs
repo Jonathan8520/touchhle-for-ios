@@ -50,6 +50,7 @@ pub mod stdio;
 pub mod stdlib;
 pub mod string;
 pub mod sys;
+pub mod syscall;
 pub mod sysctl;
 pub mod time;
 pub mod unistd;
