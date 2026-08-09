@@ -68,7 +68,18 @@ pub fn handle_darwin_syscall(env: &mut Environment, svc_pc: u32) {
                 newp,
                 newlen,
             );
-            finish(env, result);
+            // libc's `sysctl` reports failure the libc way — -1, with the
+            // reason in errno. A raw syscall reports it the kernel's way: the
+            // errno itself in r0, with the carry flag set. Translating between
+            // the two is the whole difference between the two entry points,
+            // and getting it wrong hands the caller -1 as a *successful*
+            // result.
+            if result == -1 {
+                let errno = crate::libc::errno::get_errno(env);
+                fail(env, errno);
+            } else {
+                finish(env, result);
+            }
         }
         _ => {
             log_unimplemented(svc_pc, number);
