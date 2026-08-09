@@ -392,6 +392,19 @@ struct NSDirectoryEnumeratorHostObject {
 }
 impl HostObject for NSDirectoryEnumeratorHostObject {}
 
+/// Where a directory the guest named actually lives.
+///
+/// The enumeration methods used to hand the guest's string straight to
+/// [crate::fs::Fs], which resolves a relative path against the working
+/// directory and nowhere else. `open` and `stat` instead look inside the app's
+/// bundle, which is where an app's own `assets/…` really is, so listing a
+/// directory failed for a path whose files opened perfectly well. Falls back
+/// to the path as given, so a directory that does not exist anywhere still
+/// reports the failure the caller expects.
+fn resolved_directory(env: &Environment, path: &str) -> String {
+    crate::libc::posix_io::resolve_existing_path(env, path).unwrap_or_else(|| path.to_string())
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -476,6 +489,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let path = ns_string::to_rust_string(env, path);
+    let path = resolved_directory(env, &path);
     let Ok(paths) = env.fs.enumerate(GuestPath::new(&path)) else {
         return nil;
     };
@@ -500,6 +514,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let path_str = ns_string::to_rust_string(env, path);
+    let path_str = resolved_directory(env, &path_str);
     let guest_path = GuestPath::new(&path_str);
 
     let Ok(paths) = env.fs.enumerate_recursive(guest_path) else {
@@ -531,6 +546,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let path_str = ns_string::to_rust_string(env, path);
+    let path_str = resolved_directory(env, &path_str);
     let guest_path = GuestPath::new(&path_str);
 
     let Ok(paths) = env.fs.enumerate_recursive(guest_path) else {

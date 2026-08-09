@@ -66,7 +66,17 @@ pub(super) fn opendir(env: &mut Environment, filename: ConstPtr<u8>) -> MutPtr<D
     };
     let path_string = path_string.to_owned();
     log_dbg!("opendir: filename {}", path_string);
-    let guest_path = GuestPath::new(&path_string);
+
+    // An app's own directories are named relative to its bundle, and this was
+    // the one path-taking call that did not look there — `open` and `stat` go
+    // through resolve_existing_path, whose own documentation says every one of
+    // them must. So `open("ipad/assets/ab/cd")` handed back the file while
+    // `opendir("ipad/assets/ab")` said the directory did not exist, and an
+    // asset system that scans a directory to find out what is in it got
+    // nothing, from a call that logs nothing and is counted nowhere.
+    let resolved = crate::libc::posix_io::resolve_existing_path(env, &path_string)
+        .unwrap_or_else(|| path_string.clone());
+    let guest_path = GuestPath::new(&resolved);
     let is_dir = env.fs.is_dir(guest_path);
     if is_dir {
         let dir = env.mem.alloc_and_write(DIR { idx: 0 });
@@ -78,14 +88,47 @@ pub(super) fn opendir(env: &mut Environment, filename: ConstPtr<u8>) -> MutPtr<D
             set_errno(env, ENOENT);
             return Ptr::null();
         };
-        let vec = iter.map(|(str, type_)| (str.to_string(), type_)).collect();
+        // The tree is a HashMap, so this order is whatever the hasher felt
+        // like this run — and different the next. A directory listing an app
+        // can't reproduce turns any bug that depends on it into one that comes
+        // and goes; sorting costs nothing and makes a run repeatable.
+        let mut vec: Vec<(String, FsNodeType)> =
+            iter.map(|(str, type_)| (str.to_string(), type_)).collect();
+        vec.sort_by(|(a, _), (b, _)| a.cmp(b));
         State::get_mut(env).open_dirs.insert(dir, vec);
         State::get_mut(env).read_dirs.insert(dir, Vec::new());
         dir
     } else {
+        log_dbg!("opendir: {:?} is not a directory", resolved);
         set_errno(env, ENOENT);
         Ptr::null()
     }
+}
+
+/// The `d_reclen` a real directory entry would carry: everything up to
+/// `d_name`, plus the name and its terminator, rounded up as Darwin's
+/// `_GENERIC_DIRSIZ` does.
+///
+/// It used to be zero, and the usual way to keep an entry past the next
+/// `readdir` is `memcpy(save, entry, entry->d_reclen)` — which copied nothing,
+/// leaving a list of entries with empty names and no error to explain it.
+fn record_length(name_len: usize) -> u16 {
+    const BEFORE_NAME: usize = 21; // d_ino + d_seekoff + d_reclen + d_namlen + d_type
+    let len = BEFORE_NAME + ((name_len + 1 + 3) & !3);
+    // Never claim more than was actually allocated for the entry.
+    len.min(guest_size_of::<dirent>() as usize) as u16
+}
+
+/// A stable, non-zero stand-in for an inode number.
+fn inode_for_name(name: &str) -> u64 {
+    // FNV-1a, for no reason other than that it is short and spreads well.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Zero means "this slot is empty" to a real caller.
+    hash | 1
 }
 
 // TODO: return '.' and '..' entries as well
@@ -107,6 +150,7 @@ pub(super) fn readdir(env: &mut Environment, dirp: MutPtr<DIR>) -> MutPtr<dirent
     );
     if let Some((str, type_)) = vec.get(dir.idx) {
         dir.idx += 1;
+        let next_idx = dir.idx;
         env.mem.write(dirp, dir);
 
         let len = str.len();
@@ -114,11 +158,16 @@ pub(super) fn readdir(env: &mut Environment, dirp: MutPtr<DIR>) -> MutPtr<dirent
             FsNodeType::File => DT_REG,
             FsNodeType::Directory => DT_DIR,
         };
-        // TODO: fill other fields
         let mut dirent = dirent {
-            d_ino: 0,
-            d_seekoff: 0,
-            d_reclen: 0,
+            // Zero is what a real directory uses to mark a slot that has been
+            // emptied, so code that skips those skipped every entry there was.
+            // Nothing here has real inodes; a stable number derived from the
+            // name is not one either, but it is never zero and it does tell
+            // two entries apart, which is all such code asks of it.
+            d_ino: inode_for_name(str),
+            // The position readdir would resume from, which is the next entry.
+            d_seekoff: next_idx as u64,
+            d_reclen: record_length(len),
             d_namlen: len as u16,
             d_type,
             d_name: [b'\0'; MAXPATHLEN],
