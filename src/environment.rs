@@ -1712,6 +1712,46 @@ impl Environment {
                 recent.join(" ")
             );
         }
+        self.report_watched_memory(elapsed);
+    }
+
+    /// Print the bytes at each `--watch-guest=` address.
+    ///
+    /// Disassembly can say which variable an app is stuck on without ever
+    /// saying what is in it, and a state machine that will not advance is a
+    /// question about a value, not about code. Watching costs nothing until
+    /// asked for and turns the question into a measurement.
+    fn report_watched_memory(&mut self, elapsed: f32) {
+        for &(address, length) in &self.options.watch_guest {
+            let ptr: crate::mem::ConstPtr<u8> = crate::mem::Ptr::from_bits(address);
+            // A watch on an address the app never mapped would otherwise take
+            // the emulator down with it, which is a poor answer to a question
+            // about memory.
+            let described = match self.mem.try_bytes_at(ptr, length) {
+                Some(bytes) => {
+                    let hex: Vec<String> =
+                        bytes.iter().map(|byte| format!("{:02x}", byte)).collect();
+                    // The word is what a flag, a counter or a pointer reads as
+                    // in the code that uses it; the bytes are for everything
+                    // else. Both, because which one is wanted is not knowable
+                    // from here.
+                    if length == 4 {
+                        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                        format!("{} (= {:#x}, {})", hex.join(" "), word, word)
+                    } else {
+                        hex.join(" ")
+                    }
+                }
+                None => "(not mapped)".to_string(),
+            };
+            log!(
+                "guest sample at {:.0}s: watch {:#x}+{}: {}",
+                elapsed,
+                address,
+                length,
+                described
+            );
+        }
     }
 
     pub fn run(mut self) {

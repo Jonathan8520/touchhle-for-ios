@@ -680,24 +680,31 @@ jobs:
             echo "no run.log: nothing to compare"
             exit 0
           fi
+          # `grep -c` prints 0 *and* exits 1 when it matches nothing, so
+          # `grep -c … || echo 0` printed the count and then another 0 under
+          # it. `|| true` keeps the count and drops the failure.
+          count() { grep -ac "$1" run.log || true; }
+          # And these want the fragment, not the sampler line it sits in:
+          # matching the whole line printed two thousand characters of thread
+          # state to report one number.
+          fragment() { grep -aoE "$1" run.log | tail -1; }
           echo "===== VERDICT ====="
           printf 'log lines            : %s\n' "$(wc -l < run.log)"
-          printf 'frames drawn         : %s\n' \
-            "$(grep -aoE '[0-9]+ frames' run.log | tail -1 || echo '(none reported)')"
-          printf 'last fps line        : %s\n' \
-            "$(grep -a 'fps' run.log | tail -1 || echo '(none)')"
-          printf 'files opened         : %s\n' \
-            "$(grep -a 'files opened' run.log | tail -1 || echo '(none)')"
+          printf 'frames presented     : %s\n' \
+            "$(fragment '[0-9]+ frames presented')"
+          printf 'files read           : %s\n' \
+            "$(fragment '[0-9]+ files \([0-9]+ not found')"
           printf 'directories listed   : %s\n' \
-            "$(grep -a 'directories listed' run.log | tail -1 || echo '(none)')"
-          printf 'raw syscalls         : %s\n' \
-            "$(grep -ac 'Darwin syscall' run.log || echo 0)"
-          printf 'unhandled SVCs       : %s\n' \
-            "$(grep -ac 'Unexpected SVC' run.log || echo 0)"
-          printf 'null-page accesses   : %s\n' \
-            "$(grep -ac 'NULL-PAGE' run.log || echo 0)"
-          printf 'threads started      : %s\n' \
-            "$(grep -ac 'Starting thread' run.log || echo 0)"
+            "$(fragment '[0-9]+ directories listed \([0-9]+ not found\)')"
+          printf 'guest memory         : %s\n' \
+            "$(fragment '[0-9]+ KiB of guest memory in [0-9]+ allocations')"
+          printf 'raw syscalls         : %s\n' "$(count 'Darwin syscall')"
+          printf 'unhandled SVCs       : %s\n' "$(count 'Unexpected SVC')"
+          printf 'null-page accesses   : %s\n' "$(count 'NULL-PAGE')"
+          printf 'threads              : %s\n' "$(count 'pthread_create')"
+          echo "--- what --watch-guest= saw, if anything was watched ---"
+          grep -aoE 'watch 0x[0-9a-f]+\+[0-9]+: .*' run.log | tail -24 \
+            || echo "(nothing watched)"
           echo "--- every distinct syscall or SVC the app asked for ---"
           grep -aE 'Darwin syscall|Unexpected SVC' run.log | sort -u | head -20 \
             || echo "(none)"

@@ -156,6 +156,13 @@ pub struct Options {
     pub trace_objc: Vec<String>,
     /// How often to report which guest thread is running and where.
     pub sample_guest: Option<std::time::Duration>,
+    /// Guest addresses to print the bytes of alongside each sample, as
+    /// `(address, length)`.
+    ///
+    /// An app that has stopped is usually stopped on a variable, and
+    /// disassembly can say which variable without ever saying what is in it.
+    /// This is the other half: watch the address and find out.
+    pub watch_guest: Vec<(u32, u32)>,
 }
 
 impl Default for Options {
@@ -200,6 +207,7 @@ impl Default for Options {
             zero_stack_after_guest_to_host_call: None,
             trace_objc: Vec::new(),
             sample_guest: None,
+            watch_guest: Vec::new(),
         }
     }
 }
@@ -427,6 +435,31 @@ impl Options {
                 return Err("--sample-guest= must be a positive number of seconds".to_string());
             }
             self.sample_guest = Some(std::time::Duration::from_secs_f32(seconds));
+        } else if let Some(value) = arg.strip_prefix("--watch-guest=") {
+            for spec in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let (address, length) = match spec.split_once(':') {
+                    Some((address, length)) => (address, length),
+                    // A watch with no length is one word, which is what a
+                    // flag, a counter or a pointer is.
+                    None => (spec, "4"),
+                };
+                let address =
+                    u32::from_str_radix(address.trim_start_matches("0x"), 16).map_err(|_| {
+                        "--watch-guest= wants hexadecimal addresses, optionally each with \
+                         `:length` in decimal"
+                            .to_string()
+                    })?;
+                let length: u32 = length
+                    .parse()
+                    .map_err(|_| "--watch-guest= wants a decimal length after `:`".to_string())?;
+                if length == 0 || length > 256 {
+                    return Err("--watch-guest= lengths run from 1 to 256 bytes".to_string());
+                }
+                self.watch_guest.push((address, length));
+            }
+            if self.watch_guest.is_empty() {
+                return Err("--watch-guest= requires at least one address".to_string());
+            }
         } else if let Some(value) = arg.strip_prefix("--zero-stack-after-guest-to-host-call=") {
             self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()
@@ -508,4 +541,58 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
         }
     }
     Ok(dumping_options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Options;
+
+    fn watches(arg: &str) -> Result<Vec<(u32, u32)>, String> {
+        let mut options = Options::default();
+        options.parse_argument(arg)?;
+        Ok(options.watch_guest)
+    }
+
+    #[test]
+    fn a_watch_without_a_length_is_one_word() {
+        // Which is what a flag, a counter or a pointer is.
+        assert_eq!(watches("--watch-guest=24f34f0").unwrap(), [(0x24f34f0, 4)]);
+        assert_eq!(
+            watches("--watch-guest=0x24f34f0").unwrap(),
+            [(0x24f34f0, 4)]
+        );
+    }
+
+    #[test]
+    fn several_watches_with_and_without_lengths() {
+        assert_eq!(
+            watches("--watch-guest=24f3798:1, 24f36ae:2 ,1000").unwrap(),
+            [(0x24f3798, 1), (0x24f36ae, 2), (0x1000, 4)]
+        );
+    }
+
+    #[test]
+    fn a_watch_that_says_nothing_is_refused() {
+        // Rather than silently watching nothing and reporting nothing, which
+        // reads exactly like an address whose bytes never change.
+        assert!(watches("--watch-guest=").is_err());
+        assert!(watches("--watch-guest=,,").is_err());
+    }
+
+    #[test]
+    fn lengths_that_cannot_be_printed_are_refused() {
+        assert!(watches("--watch-guest=1000:0").is_err());
+        assert!(watches("--watch-guest=1000:257").is_err());
+        assert!(watches("--watch-guest=1000:4").is_ok());
+        assert!(watches("--watch-guest=1000:256").is_ok());
+    }
+
+    #[test]
+    fn addresses_are_hexadecimal_and_lengths_are_not() {
+        // `--watch-guest=1000:10` is 4096, sixteen bytes: the address is where
+        // the app's own addresses are read from, and the length is a count.
+        assert_eq!(watches("--watch-guest=1000:10").unwrap(), [(0x1000, 10)]);
+        assert!(watches("--watch-guest=zz").is_err());
+        assert!(watches("--watch-guest=1000:zz").is_err());
+    }
 }

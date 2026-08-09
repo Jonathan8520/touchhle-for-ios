@@ -410,6 +410,19 @@ Other options:
         reports the same address every time. The addresses are guest
         addresses, so dev-scripts/disassemble-guest.py takes them directly.
 
+    --watch-guest=<address>[:<length>][,<address>[:<length>]...]
+        For diagnostic builds. Print the bytes at each guest address every
+        time --sample-guest= reports (it does nothing on its own). Addresses
+        are hexadecimal, lengths are decimal and default to 4 — one word,
+        which is what a flag, a counter or a pointer is. A four-byte watch
+        also prints the word it reads as.
+        An app that has stopped is usually stopped on a variable, and
+        disassembly can name that variable without ever saying what is in
+        it: dev-scripts/disassemble-guest.py --field finds the code that
+        reads a struct field, and this says what the field held while the
+        app was refusing to move. An address the app never mapped is
+        reported as such rather than guessed at.
+
     --fix-texture-min-filter
         Workaround for apps that rely on the default ES 1.1
         GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable

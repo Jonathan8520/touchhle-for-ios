@@ -617,6 +617,28 @@ impl Mem {
         }
         &self.bytes()[addr..][..count as usize]
     }
+    /// Like [Self::bytes_at], but says so when the range is not there instead
+    /// of standing in for it.
+    ///
+    /// [Self::bytes_at] answers an out-of-range read with the null stub page
+    /// and a warning, which is the right thing for a guest that has computed a
+    /// bad pointer: it keeps running. It is the wrong thing for host code that
+    /// is *asking a question about* an address, which wants "nothing there"
+    /// rather than a page of stand-in bytes and a warning about a mistake the
+    /// guest did not make.
+    pub fn try_bytes_at<const MUT: bool>(
+        &self,
+        ptr: Ptr<u8, MUT>,
+        count: GuestUSize,
+    ) -> Option<&[u8]> {
+        let addr = ptr.to_bits() as usize;
+        let end = addr.saturating_add(count as usize);
+        if ptr.to_bits() < self.null_segment_size || end > self.bytes().len() || end < addr {
+            return None;
+        }
+        Some(&self.bytes()[addr..][..count as usize])
+    }
+
     /// Get a slice for reading `count` bytes without a null-page check.
     ///
     /// This **doesn't** panic at access within the null page.
