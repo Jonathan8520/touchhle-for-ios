@@ -791,7 +791,7 @@ fn unsetenv(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
     }
 }
 
-fn exit(env: &mut Environment, exit_code: i32) {
+pub(crate) fn exit(env: &mut Environment, exit_code: i32) {
     set_errno(env, 0);
 
     // Забираем список функций через mem::take, чтобы избежать проблем с borrow

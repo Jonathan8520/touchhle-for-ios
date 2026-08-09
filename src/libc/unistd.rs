@@ -131,7 +131,7 @@ fn isatty(env: &mut Environment, fd: FileDescriptor) -> i32 {
     }
 }
 
-fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
+pub(crate) fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 

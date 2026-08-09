@@ -11,10 +11,10 @@ use std::sync::LazyLock;
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::errno::set_errno;
 use crate::libc::sysctl::SysInfoType::String;
-use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, MutVoidPtr, PAGE_SIZE};
+use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, PAGE_SIZE};
 use crate::Environment;
 
-static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 29] = [
+static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 28] = [
     // Generic CPU, I/O
     ((6,1), "hw.machine" , String(b"iPhone2,1")), // overridden dynamically below
     ((6,2), "hw.model" , String(b"N88AP")),
@@ -41,7 +41,6 @@ static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 29] = [
     ((0,0), "hw.l2cachesize", SysInfoType::Int32(0)),
     ((0,0), "hw.l3cachesize", SysInfoType::Int32(0)),
 
-    ((1, 14), "kern.osversion", String(b"10B141")),
     ((6,5), "hw.physmem" , SysInfoType::Int32(536870912)),
     ((6,6), "hw.usermem" , SysInfoType::Int32(402653184)),
     ((6,24), "hw.memsize" , SysInfoType::Int32(536870912)),
@@ -49,14 +48,26 @@ static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 29] = [
     // High kernel limits
     ((1,1), "kern.ostype" , String(b"Darwin")),
     ((1,2), "kern.osrelease" , String(b"13.0.0")),
-    ((1,3), "kern.osversion" , String(b"10B141")),
+    // KERN_OSREV is an int, not a string: `kern.osrevision` is a number and
+    // the build string lives under KERN_OSVERSION below.
+    ((1,3), "kern.osrevision" , SysInfoType::Int32(199506)),
     ((1,10), "kern.hostname" , String(b"touchHLE")),
     ((1,4), "kern.version" , String(b"Darwin Kernel Version 13.0.0: Wed Jun 13 16:55:00 PDT 2012; root:xnu-2107.7.55~11/RELEASE_ARM_S5L8920X")),
     ((1,21), "kern.boottime" , SysInfoType::Int64(1600000000)),
-    // kern.proc.pid is a node for process information. Some games probe
-    // it with sysctl([CTL_KERN, KERN_PROC, ...]) and only need success.
-    ((1,65), "kern.proc.pid", SysInfoType::Bytes(b"")),
+    // KERN_OSVERSION is 65, and it is the build number. It used to be listed
+    // as 14 — which is KERN_PROC, a different thing of a different shape (see
+    // `kern_proc` below) — while 65 was listed as `kern.proc.pid`. The two had
+    // been swapped, so an app asking the kernel about a process was handed the
+    // string "10B141" and told it had succeeded.
+    ((1,65), "kern.osversion" , String(b"10B141")),
 ];
+
+/// `CTL_KERN`, the first component of a MIB naming something about the kernel.
+const CTL_KERN: i32 = 1;
+/// `KERN_PROC`, which names process table entries.
+const KERN_PROC: i32 = 14;
+/// `KERN_PROC_PID`, the third MIB component asking for one process by pid.
+const KERN_PROC_PID: i32 = 1;
 
 static STRING_MAP: LazyLock<HashMap<&str, SysInfoType>> = LazyLock::new(|| {
     // Can't use from_iter because the closure erases the lifetime
@@ -137,6 +148,13 @@ pub(crate) fn sysctl(
         return 0;
     }
 
+    // kern.proc is a table of processes, not a value: it answers with a
+    // `struct kinfo_proc`, and the generic path below has no way to describe
+    // one.
+    if name0 == CTL_KERN && name1 == KERN_PROC {
+        return kern_proc(env, name, name_len, oldp, oldlenp);
+    }
+
     sysctl_generic(
         env,
         |env| {
@@ -182,6 +200,97 @@ pub(crate) fn sysctl(
         newp,
         newlen,
     )
+}
+
+/// `sizeof(struct kinfo_proc)` as a 32-bit Darwin builds it: 196 bytes of
+/// `struct extern_proc` followed by 304 of `struct eproc`.
+///
+/// Only used to answer a caller that asks how big the answer is before making
+/// room for it. Everything below works from the size the caller actually
+/// offers, so being a few bytes out here cannot make us write past a buffer.
+const KINFO_PROC_SIZE: GuestUSize = 500;
+
+/// Offsets into `struct extern_proc`, which `struct kinfo_proc` starts with.
+const KP_PROC_P_FLAG: GuestUSize = 16;
+const KP_PROC_P_STAT: GuestUSize = 20;
+const KP_PROC_P_PID: GuestUSize = 24;
+/// `SRUN`, the `p_stat` of a process that is runnable — which this one is,
+/// since it is the one asking.
+const SRUN: u8 = 2;
+
+/// `sysctl([CTL_KERN, KERN_PROC, KERN_PROC_PID, pid])` — what a process can
+/// find out about a process.
+///
+/// The one thing apps of this era actually ask this for is whether they are
+/// being debugged: Apple's own `AmIBeingDebugged()` reads `p_flag & P_TRACED`
+/// from the answer, and a good deal of anti-tamper code is a copy of it. We
+/// are not a debugger, so every flag reads back as zero, which says no.
+///
+/// The rest is left zeroed rather than invented. A field we do not know is
+/// better read as "nothing" than as a number that means something specific and
+/// wrong — and unlike the string this used to return, zeros cannot be mistaken
+/// for process state.
+fn kern_proc(
+    env: &mut Environment,
+    name: MutPtr<i32>,
+    name_len: u32,
+    oldp: MutVoidPtr,
+    oldlenp: MutPtr<GuestUSize>,
+) -> i32 {
+    if name_len < 4 || env.mem.read(name + 2) != KERN_PROC_PID {
+        // KERN_PROC_ALL and the other selectors ask for a list, whose length we
+        // would have to agree on with the caller. Nothing has needed it.
+        log!(
+            "sysctl(): kern.proc with {} components (selector {}) is not implemented, returning -1",
+            name_len,
+            if name_len >= 3 {
+                env.mem.read(name + 2)
+            } else {
+                -1
+            },
+        );
+        set_errno(env, super::errno::EINVAL);
+        return -1;
+    }
+
+    if oldlenp.is_null() {
+        // The kernel has nowhere to say how much it wrote, so it writes
+        // nothing. Panicking over a guest's bad pointer would take the whole
+        // emulator down with it.
+        set_errno(env, super::errno::EFAULT);
+        return -1;
+    }
+    if oldp.is_null() {
+        env.mem.write(oldlenp, KINFO_PROC_SIZE);
+        return 0;
+    }
+
+    // Fill what the caller offered room for and no more. A caller whose idea of
+    // the struct is smaller than ours gets a short but honest answer instead of
+    // a failure it would have to explain.
+    let len = env.mem.read(oldlenp).min(KINFO_PROC_SIZE);
+    if len > 0 {
+        env.mem.bytes_at_mut(oldp.cast(), len).fill(0);
+    }
+    if len >= KP_PROC_P_STAT + 1 {
+        env.mem
+            .write(Ptr::from_bits(oldp.to_bits() + KP_PROC_P_STAT), SRUN);
+    }
+    if len >= KP_PROC_P_PID + 4 {
+        let pid = crate::libc::unistd::getpid(env);
+        env.mem
+            .write(Ptr::from_bits(oldp.to_bits() + KP_PROC_P_PID), pid);
+    }
+    if len >= KP_PROC_P_FLAG + 4 {
+        // No P_TRACED, so "am I being debugged?" answers no. The fill above
+        // already left a zero here; writing it where the reader will look for
+        // it is how the answer stays deliberate rather than incidental.
+        env.mem
+            .write(Ptr::from_bits(oldp.to_bits() + KP_PROC_P_FLAG), 0i32);
+    }
+    env.mem.write(oldlenp, len);
+    log_dbg!("sysctl kern.proc.pid: wrote {} bytes of kinfo_proc", len);
+    0
 }
 
 fn sysctlbyname(
@@ -355,3 +464,45 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sysctl(_, _, _, _, _, _)),
     export_c_func!(sysctlbyname(_, _, _, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kern_proc_is_not_listed_as_a_value() {
+        // (CTL_KERN, KERN_PROC) answers with a `struct kinfo_proc`, which the
+        // table has no way to describe, so `kern_proc` handles it instead. It
+        // was once listed here as `kern.osversion` — so an app asking the
+        // kernel about a process was handed the string "10B141" and told the
+        // call had succeeded.
+        assert!(INT_MAP.get(&(CTL_KERN, KERN_PROC)).is_none());
+    }
+
+    #[test]
+    fn kern_osversion_is_65() {
+        // ...and not 14, which is KERN_PROC. The two used to be swapped.
+        let (name, _) = INT_MAP
+            .get(&(CTL_KERN, 65))
+            .expect("KERN_OSVERSION should be in the table");
+        assert_eq!(*name, "kern.osversion");
+    }
+
+    #[test]
+    fn no_two_entries_claim_the_same_mib() {
+        // (0, 0) is the placeholder for entries only reachable by name.
+        let mut seen = std::collections::HashSet::new();
+        for (mib, name, _) in SYSCTL_VALUES.iter() {
+            if *mib == (0, 0) {
+                continue;
+            }
+            assert!(
+                seen.insert(*mib),
+                "{:?} is claimed twice, the second time by {}; \
+                 one of the two silently loses",
+                mib,
+                name
+            );
+        }
+    }
+}

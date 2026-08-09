@@ -572,13 +572,13 @@ unsafe impl SafeRead for timespec {}
 
 #[allow(non_camel_case_types)]
 #[repr(C, packed)]
-struct timezone {
+pub(crate) struct timezone {
     tz_minuteswest: i32,
     tz_dsttime: i32,
 }
 unsafe impl SafeRead for timezone {}
 
-fn gettimeofday(
+pub(crate) fn gettimeofday(
     env: &mut Environment,
     timeval_ptr: MutPtr<timeval>,
     timezone_ptr: MutPtr<timezone>,
