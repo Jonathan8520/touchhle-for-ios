@@ -643,6 +643,39 @@ fn record_open(path: &GuestPath, working_directory: &GuestPath, succeeded: bool)
     }
 }
 
+/// Directories the guest asked to list: how many it got and how many it was
+/// told were not there.
+///
+/// Opening a file and listing a directory are different questions, and an app
+/// can get a "yes" to the first and a "no" to the second for the same tree.
+/// Counting them apart is what makes that visible; a listing that failed used
+/// to leave no trace anywhere.
+static LISTINGS: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+pub fn record_directory_listing(path: &GuestPath, succeeded: bool) {
+    if let Ok(mut listings) = LISTINGS.lock() {
+        if succeeded {
+            listings.0 += 1;
+        } else {
+            listings.1 += 1;
+        }
+    }
+    if let Ok(mut recent) = RECENT.lock() {
+        if recent.len() == RECENT_OPENS {
+            recent.pop_front();
+        }
+        recent.push_back((succeeded, format!("{}/", path.as_str())));
+    }
+}
+
+/// How many directory listings succeeded, and how many failed.
+pub fn listing_summary() -> (u64, u64) {
+    match LISTINGS.lock() {
+        Ok(listings) => *listings,
+        Err(_) => (0, 0),
+    }
+}
+
 /// The last few paths the guest opened, oldest first, each marked with whether
 /// it was there. See [RECENT_OPENS].
 pub fn recent_opens() -> Vec<String> {

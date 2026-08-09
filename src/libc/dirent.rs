@@ -78,6 +78,7 @@ pub(super) fn opendir(env: &mut Environment, filename: ConstPtr<u8>) -> MutPtr<D
         .unwrap_or_else(|| path_string.clone());
     let guest_path = GuestPath::new(&resolved);
     let is_dir = env.fs.is_dir(guest_path);
+    crate::fs::record_directory_listing(GuestPath::new(&path_string), is_dir);
     if is_dir {
         let dir = env.mem.alloc_and_write(DIR { idx: 0 });
         log_dbg!("opendir: new DIR ptr: {:?}", dir);
