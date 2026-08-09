@@ -863,4 +863,178 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(NXGetArchInfoFromName(_)),
     export_c_func!(NXGetLocalArchInfo()),
     export_c_func!(NXGetAllArchInfos()),
+    export_c_func!(getsectbynamefromheader(_, _, _)),
+    export_c_func!(getsectdatafromheader(_, _, _, _)),
+    export_c_func!(getsegbynamefromheader(_, _)),
 ];
+
+// --- getsect.h ---
+//
+// An app that puts data in a segment of its own — Disney Infinity 1 ships an
+// `__ETC` segment full of compressed textures — has to find it at runtime, and
+// this is the only API for that. It was an unimplemented stub returning 0,
+// which is how the same API says "no such section", so the app was told its
+// own data was not in its own binary.
+//
+// These read the guest's copy of the Mach-O header rather than any host-side
+// bookkeeping, exactly as the real functions do. That makes them right for any
+// image the guest hands them, not only the main executable, and right about a
+// header the guest has patched.
+
+const LC_SEGMENT: u32 = 0x1;
+/// `sizeof(struct mach_header)` on 32-bit: magic, cputype, cpusubtype,
+/// filetype, ncmds, sizeofcmds, flags.
+const MACH_HEADER_SIZE: GuestUSize = 28;
+/// Offset of `ncmds` within `struct mach_header`.
+const MACH_HEADER_NCMDS: GuestUSize = 16;
+/// `sizeof(struct segment_command)` on 32-bit; the section headers follow it.
+const SEGMENT_COMMAND_SIZE: GuestUSize = 56;
+/// Offsets within `struct segment_command`.
+const SEGMENT_SEGNAME: GuestUSize = 8;
+const SEGMENT_NSECTS: GuestUSize = 48;
+/// `sizeof(struct section)` on 32-bit.
+const SECTION_SIZE: GuestUSize = 68;
+/// Offsets within `struct section`.
+const SECTION_SECTNAME: GuestUSize = 0;
+const SECTION_SEGNAME: GuestUSize = 16;
+const SECTION_ADDR: GuestUSize = 32;
+const SECTION_SIZE_FIELD: GuestUSize = 36;
+
+/// A word out of a header the guest owns.
+fn read_u32(env: &Environment, address: u32) -> u32 {
+    let ptr: ConstPtr<u32> = Ptr::from_bits(address);
+    env.mem.read(ptr)
+}
+
+/// A fixed-width name field out of a header the guest owns.
+fn name_at(address: u32) -> ConstPtr<u8> {
+    Ptr::from_bits(address)
+}
+
+/// Whether the fixed-width, NUL-padded name at `at` is `wanted`.
+///
+/// A Mach-O name field is 16 bytes and is *not* NUL-terminated when the name
+/// fills it, so `strcmp` on it would run off the end into the next field.
+fn name_matches(env: &Environment, at: ConstPtr<u8>, wanted: &str) -> bool {
+    if wanted.len() > 16 {
+        return false;
+    }
+    let bytes = env.mem.bytes_at(at, 16);
+    let name_len = bytes.iter().position(|&b| b == 0).unwrap_or(16);
+    &bytes[..name_len] == wanted.as_bytes()
+}
+
+/// `const struct section *getsectbynamefromheader(const struct mach_header *mhp,
+/// const char *segname, const char *sectname)`.
+fn getsectbynamefromheader(
+    env: &mut Environment,
+    mhp: ConstPtr<u8>,
+    segname: ConstPtr<u8>,
+    sectname: ConstPtr<u8>,
+) -> ConstPtr<u8> {
+    if mhp.is_null() {
+        return Ptr::null();
+    }
+    let Ok(want_seg) = env.mem.cstr_at_utf8(segname).map(str::to_owned) else {
+        return Ptr::null();
+    };
+    let Ok(want_sect) = env.mem.cstr_at_utf8(sectname).map(str::to_owned) else {
+        return Ptr::null();
+    };
+
+    let ncmds = read_u32(env, mhp.to_bits() + MACH_HEADER_NCMDS);
+    let mut command = mhp.to_bits() + MACH_HEADER_SIZE;
+    for _ in 0..ncmds {
+        let cmd = read_u32(env, command);
+        let cmdsize = read_u32(env, command + 4);
+        if cmdsize == 0 {
+            break;
+        }
+        if cmd == LC_SEGMENT && name_matches(env, name_at(command + SEGMENT_SEGNAME), &want_seg) {
+            let nsects = read_u32(env, command + SEGMENT_NSECTS);
+            let mut section = command + SEGMENT_COMMAND_SIZE;
+            for _ in 0..nsects {
+                if name_matches(env, name_at(section + SECTION_SECTNAME), &want_sect) {
+                    return Ptr::from_bits(section);
+                }
+                section += SECTION_SIZE;
+            }
+        }
+        command += cmdsize;
+    }
+    Ptr::null()
+}
+
+/// `char *getsectdatafromheader(const struct mach_header *mhp,
+/// const char *segname, const char *sectname, uint32_t *size)`.
+///
+/// Returns the section's `addr` as recorded in the header, which is an
+/// unslid address — Apple's own implementation does the same, and callers add
+/// `_dyld_get_image_vmaddr_slide()` themselves. touchHLE loads the main
+/// executable with a slide of zero, so for it the two are the same.
+fn getsectdatafromheader(
+    env: &mut Environment,
+    mhp: ConstPtr<u8>,
+    segname: ConstPtr<u8>,
+    sectname: ConstPtr<u8>,
+    size: MutPtr<u32>,
+) -> ConstPtr<u8> {
+    let section = getsectbynamefromheader(env, mhp, segname, sectname);
+    if section.is_null() {
+        // The documented "not found" answer is a null pointer *and* a zero
+        // size. A caller that only checks the size would otherwise read from
+        // whatever the uninitialised variable held.
+        if !size.is_null() {
+            env.mem.write(size, 0);
+        }
+        log_dbg!(
+            "getsectdatafromheader({:?}, {:?}, {:?}): no such section",
+            mhp,
+            env.mem.cstr_at_utf8(segname),
+            env.mem.cstr_at_utf8(sectname)
+        );
+        return Ptr::null();
+    }
+    let addr = read_u32(env, section.to_bits() + SECTION_ADDR);
+    let section_size = read_u32(env, section.to_bits() + SECTION_SIZE_FIELD);
+    if !size.is_null() {
+        env.mem.write(size, section_size);
+    }
+    log_dbg!(
+        "getsectdatafromheader: {:?},{:?} is {} bytes at {:#x}",
+        env.mem.cstr_at_utf8(segname),
+        env.mem.cstr_at_utf8(sectname),
+        section_size,
+        addr
+    );
+    Ptr::from_bits(addr)
+}
+
+/// `const struct segment_command *getsegbynamefromheader(const struct
+/// mach_header *mhp, const char *segname)`.
+fn getsegbynamefromheader(
+    env: &mut Environment,
+    mhp: ConstPtr<u8>,
+    segname: ConstPtr<u8>,
+) -> ConstPtr<u8> {
+    if mhp.is_null() {
+        return Ptr::null();
+    }
+    let Ok(want_seg) = env.mem.cstr_at_utf8(segname).map(str::to_owned) else {
+        return Ptr::null();
+    };
+    let ncmds = read_u32(env, mhp.to_bits() + MACH_HEADER_NCMDS);
+    let mut command = mhp.to_bits() + MACH_HEADER_SIZE;
+    for _ in 0..ncmds {
+        let cmd = read_u32(env, command);
+        let cmdsize = read_u32(env, command + 4);
+        if cmdsize == 0 {
+            break;
+        }
+        if cmd == LC_SEGMENT && name_matches(env, name_at(command + SEGMENT_SEGNAME), &want_seg) {
+            return Ptr::from_bits(command);
+        }
+        command += cmdsize;
+    }
+    Ptr::null()
+}

@@ -11,7 +11,7 @@ use crate::abi::GuestFunction;
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef;
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
-use crate::mem::{ConstPtr, MutPtr, MutVoidPtr};
+use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
@@ -39,6 +39,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 struct SCNetworkReachabilityHostObject {
     name: Option<String>,
     callout: Option<GuestFunction>,
+    /// The `info` pointer out of the caller's `SCNetworkReachabilityContext` —
+    /// *not* the address of the context itself. See
+    /// [SCNetworkReachabilitySetCallback].
     context: MutVoidPtr,
     /// Whether the target is currently scheduled for monitoring, so that a
     /// callback set after scheduling is still delivered. Apple's own
@@ -47,6 +50,16 @@ struct SCNetworkReachabilityHostObject {
     scheduled: bool,
 }
 impl HostObject for SCNetworkReachabilityHostObject {}
+
+/// `SCNetworkReachabilityContext`, which is the same shape as every other
+/// Core Foundation context: a version, the pointer the callback is handed, and
+/// three optional callbacks for managing that pointer's lifetime.
+mod context {
+    use crate::mem::GuestUSize;
+    pub const VERSION: GuestUSize = 0;
+    pub const INFO: GuestUSize = 4;
+    pub const RETAIN: GuestUSize = 8;
+}
 
 type SCNetworkReachabilityRef = CFTypeRef;
 
@@ -230,17 +243,71 @@ pub fn deliver_pending_callbacks(env: &mut Environment) {
     }
 }
 
+/// `Boolean SCNetworkReachabilitySetCallback(SCNetworkReachabilityRef target,
+/// SCNetworkReachabilityCallBack callout, SCNetworkReachabilityContext
+/// *context)`.
+///
+/// The third argument is a *pointer to* a context structure, and the pointer
+/// the callback is handed is the `info` field inside it. Passing the context's
+/// own address on instead gave every callback a pointer to a five-word struct
+/// where it expected its own object — which the callers say out loud, because
+/// Apple's Reachability sample asserts on it and everyone has a copy:
+///
+/// ```text
+/// NSCAssert failed in ReachabilityCallback at CSReachability.m:87
+///   — info was wrong class in ReachabilityCallback
+/// ```
+///
+/// Disney Infinity 1 hits that assertion three times before it finishes
+/// launching, once for comScore's copy and twice for Crittercism's.
 fn SCNetworkReachabilitySetCallback(
     env: &mut Environment,
     target: SCNetworkReachabilityRef,
     callout: GuestFunction,
-    context: MutVoidPtr,
+    context: MutPtr<u8>,
 ) -> bool {
+    // A NULL context is allowed and means the callback gets NULL.
+    let info: MutVoidPtr = if context.is_null() {
+        Ptr::null()
+    } else {
+        let version: u32 = env.mem.read(context.cast::<u32>() + context::VERSION / 4);
+        if version != 0 {
+            log!(
+                "Warning: SCNetworkReachabilityContext version {} is not one this knows; \
+                 reading it as version 0.",
+                version
+            );
+        }
+        let info_slot: MutPtr<MutVoidPtr> = Ptr::from_bits(context.to_bits() + context::INFO);
+        let info: MutVoidPtr = env.mem.read(info_slot);
+        // Core Foundation retains `info` through the context's own callback so
+        // that the target may outlive the caller's reference to it. Skipping
+        // that would leave the callback holding a pointer to a freed object.
+        let retain_slot: MutPtr<GuestFunction> =
+            Ptr::from_bits(context.to_bits() + context::RETAIN);
+        let retain: GuestFunction = env.mem.read(retain_slot);
+        if !retain.to_ptr().is_null() && !info.is_null() {
+            let retained: MutVoidPtr = <GuestFunction as crate::abi::CallFromHost<
+                MutVoidPtr,
+                (MutVoidPtr,),
+            >>::call_from_host(&retain, env, (info,));
+            // CF's convention is that the retain callback returns the pointer
+            // to keep, which is normally the one it was given.
+            if !retained.is_null() {
+                retained
+            } else {
+                info
+            }
+        } else {
+            info
+        }
+    };
+
     let host = env
         .objc
         .borrow_mut::<SCNetworkReachabilityHostObject>(target);
     host.callout = Some(callout);
-    host.context = context;
+    host.context = info;
     let already_scheduled = host.scheduled;
     if already_scheduled {
         schedule_first_callback(target);
