@@ -396,7 +396,7 @@ jobs:
           CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
         run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
       - name: Publish HyperHLE release
-        uses: softprops/action-gh-release@master
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
           name: HyperHLE ${{ needs.check-hyperhle-release.outputs.version }}

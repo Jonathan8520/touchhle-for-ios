@@ -666,3 +666,38 @@ jobs:
             echo "===== disassembly around the requested addresses ====="
             cat disassembly.txt
           fi
+
+      # Everything above is long, and a reader that can only see the end of
+      # this job's output — which is anything reading it through the API, and
+      # a human on a phone — cannot search it. These few lines answer "did
+      # this run behave like the last one" without searching anything, so
+      # they go last, after the disassembly and after the log.
+      - name: The numbers worth comparing between runs
+        if: ${{ always() }}
+        run: |
+          set -eu
+          if [ ! -f run.log ]; then
+            echo "no run.log: nothing to compare"
+            exit 0
+          fi
+          echo "===== VERDICT ====="
+          printf 'log lines            : %s\n' "$(wc -l < run.log)"
+          printf 'frames drawn         : %s\n' \
+            "$(grep -aoE '[0-9]+ frames' run.log | tail -1 || echo '(none reported)')"
+          printf 'last fps line        : %s\n' \
+            "$(grep -a 'fps' run.log | tail -1 || echo '(none)')"
+          printf 'files opened         : %s\n' \
+            "$(grep -a 'files opened' run.log | tail -1 || echo '(none)')"
+          printf 'directories listed   : %s\n' \
+            "$(grep -a 'directories listed' run.log | tail -1 || echo '(none)')"
+          printf 'raw syscalls         : %s\n' \
+            "$(grep -ac 'Darwin syscall' run.log || echo 0)"
+          printf 'unhandled SVCs       : %s\n' \
+            "$(grep -ac 'Unexpected SVC' run.log || echo 0)"
+          printf 'null-page accesses   : %s\n' \
+            "$(grep -ac 'NULL-PAGE' run.log || echo 0)"
+          printf 'threads started      : %s\n' \
+            "$(grep -ac 'Starting thread' run.log || echo 0)"
+          echo "--- every distinct syscall or SVC the app asked for ---"
+          grep -aE 'Darwin syscall|Unexpected SVC' run.log | sort -u | head -20 \
+            || echo "(none)"
