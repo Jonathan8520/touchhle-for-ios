@@ -28,7 +28,11 @@ use crate::Environment;
 /// `svc #0x80`, the instruction Darwin uses for a system call.
 ///
 /// It falls inside the range touchHLE hands out for its own host functions, so
-/// only an SVC that has no host function behind it can be one of these.
+/// only an SVC that has no host function behind it can be one of these. The
+/// converse is not guaranteed: once an app has linked enough host functions to
+/// reach the slot 128 would name, a raw syscall would call that function
+/// instead. Nothing here can tell them apart, which is a reason to link the
+/// syscalls an app needs rather than to rely on this path.
 pub const DARWIN_SYSCALL_SVC: u32 = 0x80;
 
 /// `__sysctl`, from XNU's `syscalls.master`.
