@@ -862,6 +862,7 @@ def field_access(capstone, data, offsets):
     arm = capstone.arm
     prologues = []
     hits = {offset: [] for offset in offsets}
+    on_stack = {offset: 0 for offset in offsets}
 
     for instruction, _restarted in iter_code(capstone, data):
         mnemonic = instruction.mnemonic
@@ -885,25 +886,42 @@ def field_access(capstone, data, offsets):
             # literal pool load — a constant, not a field of anything.
             if memory.index != 0 or memory.base in (0, arm.ARM_REG_PC):
                 continue
-            if memory.disp in wanted:
-                hits[memory.disp].append(
-                    (
-                        instruction.address,
-                        mnemonic,
-                        instruction.op_str,
-                        "writes" if mnemonic.startswith("str") else "reads",
-                    )
+            if memory.disp not in wanted:
+                break
+            # `[sp, #n]` is a local variable in a big stack frame, and a
+            # function with a frame that large has one at almost every offset.
+            # On the offset that prompted this, those outnumbered the real
+            # field accesses three to one and buried them. An object reached
+            # through `self` or `this` is never addressed from sp.
+            if memory.base == arm.ARM_REG_SP:
+                on_stack[memory.disp] += 1
+                break
+            hits[memory.disp].append(
+                (
+                    instruction.address,
+                    mnemonic,
+                    instruction.op_str,
+                    "writes" if mnemonic.startswith("str") else "reads",
                 )
+            )
             break
 
     prologues.sort()
-    report_field_access(data, offsets, hits, prologues)
+    report_field_access(data, offsets, hits, prologues, on_stack)
 
 
-def report_field_access(data, offsets, hits, prologues):
+def report_field_access(data, offsets, hits, prologues, on_stack):
     for offset in offsets:
         print()
         print("=== instructions using the displacement {:#x} ===".format(offset))
+        # Said out loud rather than silently dropped: a count of zero here and
+        # an empty list below mean different things.
+        if on_stack[offset]:
+            print(
+                "({} further access(es) were [sp, #{:#x}] — stack frames, not fields)".format(
+                    on_stack[offset], offset
+                )
+            )
         rows = sorted(set(hits[offset]))
         if not rows:
             print("(none — nothing in the binary uses that displacement)")
